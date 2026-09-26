@@ -1,0 +1,34 @@
+# Local secrets and machine-specific configuration
+**/local.properties
+**/google-services.json
+**/*.jks
+**/*.keystore
+**/*.pem
+**/*.p12
+**/.env
+**/.env.*
+
+# Generated Android/Gradle and Node/Vela build data
+**/.gradle/
+**/build/
+**/node_modules/
+**/dist/
+**/.idea/
+**/.DS_Store
+*.log
+
+# Private device diagnostics and archives
+**/logcat*.txt
+**/*device-log*
+**/diagnostics-private/
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Local signing config examples should use fake values only
+
+# Tracked validation log
+!artifacts/vela/build-0.1.4.log
+__pycache__/
+*.py[cod]

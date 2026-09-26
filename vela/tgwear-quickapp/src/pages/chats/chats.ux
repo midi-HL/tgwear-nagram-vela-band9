@@ -1,0 +1,324 @@
+<template>
+  <div class="page">
+    <list class="list" id="chatList">
+      <!-- 会话列表 -->
+      <list-item class="item" for="{{dialogs}}" @click="openChat($item)" type="dialog">
+        <!-- 头像占位 -->
+        <div class="cover-image">
+          <text class="cover-text">{{$item.initial}}</text>
+        </div>
+        <!-- 中间信息 -->
+        <div class="cover-content">
+          <text class="itemtext">{{$item.title}}</text>
+          <text class="itemtext2">{{$item.preview}}</text>
+        </div>
+        <!-- 右侧时间和未读 -->
+        <div class="cover-right">
+          <text class="time-text">{{$item.timeText}}</text>
+          <div class="unread-badge" if="{{$item.unread_count > 0}}">
+            <text class="unread-text">{{$item.unread_count > 99 ? '99+' : $item.unread_count}}</text>
+          </div>
+        </div>
+      </list-item>
+
+      <!-- 空状态 -->
+      <list-item if="{{dialogs.length === 0 && !loading}}" class="empty-item" type="empty">
+        <image src="/common/images/empty.png" static
+               style="width:92px;height:92px;margin-left:60px;margin-top:80px;" />
+        <text style="margin-top:12px;width:212px;text-align:center;font-size:18px;color:rgba(255,255,255,0.4);">暂无会话</text>
+      </list-item>
+
+      <!-- 加载中 -->
+      <list-item if="{{loading}}" class="empty-item" type="loading">
+        <text style="margin-top:200px;width:212px;text-align:center;font-size:18px;color:rgba(255,255,255,0.6);">加载中...</text>
+      </list-item>
+
+      <!-- 加载更多 -->
+      <list-item if="{{hasMore && dialogs.length > 0}}" @click="loadMore" class="load-more-item" type="more">
+        <text style="font-size:18px;color:rgba(255,255,255,0.6);">加载更多</text>
+      </list-item>
+    </list>
+
+    <!-- 顶部 header（对齐 ebook o66: hd.png 212x82, 时间 top16/18px, 标题 top36/26px） -->
+    <image src="/common/images/hd.png" static
+           style="position:absolute;left:0px;top:0px;width:212px;height:82px;" />
+    <text style="position:absolute;top:16px;left:0px;width:212px;line-height:24px;text-align:center;font-size:16px;color:rgba(255,255,255,0.6);">
+      {{nowTime}}
+    </text>
+    <text static style="position:absolute;top:36px;left:0px;width:212px;line-height:42px;text-align:center;font-size:26px;font-weight:bold;color:#ffffff;">
+      会话
+    </text>
+
+    <!-- 底部菜单按钮 -->
+    <image src="/common/images/more.png" static @click="openSetting"
+           style="position:absolute;left:70px;top:398px;width:72px;height:72px;" />
+  </div>
+</template>
+
+<style>
+.page {
+  width: 212px;
+  height: 520px;
+  background-color: #000000;
+}
+.list {
+  width: 212px;
+  height: 520px;
+  position: absolute;
+  top: 0px;
+  left: 0px;
+  padding: 86px 12px;
+}
+.item {
+  width: 100%;
+  height: 85px;
+  padding: 12px 18px;
+  margin-bottom: 8px;
+  background-color: #262626;
+  border-radius: 26px;
+  align-items: center;
+  justify-content: space-between;
+}
+.cover-image {
+  width: 52px;
+  height: 52px;
+  background-color: #2ea0ff;
+  border-radius: 26px;
+  margin-right: 12px;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.cover-text {
+  font-size: 24px;
+  font-weight: bold;
+  color: #ffffff;
+}
+.cover-content {
+  flex-direction: column;
+  justify-content: space-around;
+  align-items: flex-start;
+  flex: 1;
+  height: 100%;
+  overflow: hidden;
+}
+.itemtext {
+  font-size: 23px;
+  width: 100%;
+  font-weight: bold;
+  color: #ffffff;
+  text-overflow: ellipsis;
+  lines: 1;
+}
+.itemtext2 {
+  font-size: 20px;
+  font-weight: bold;
+  color: rgba(255,255,255,0.6);
+  text-overflow: ellipsis;
+  lines: 1;
+}
+.cover-right {
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  height: 100%;
+  flex-shrink: 0;
+}
+.time-text {
+  font-size: 14px;
+  color: rgba(255,255,255,0.4);
+  margin-bottom: 4px;
+}
+.unread-badge {
+  background-color: #2ea0ff;
+  border-radius: 14px;
+  padding: 2px 8px;
+  min-width: 20px;
+  align-items: center;
+  justify-content: center;
+}
+.unread-text {
+  font-size: 14px;
+  font-weight: bold;
+  color: #ffffff;
+}
+.empty-item {
+  width: 100%;
+  align-items: center;
+  flex-direction: column;
+  padding: 0px;
+  background-color: transparent;
+}
+.load-more-item {
+  width: 100%;
+  height: 60px;
+  align-items: center;
+  justify-content: center;
+  background-color: transparent;
+}
+</style>
+
+<script>
+import api from '../../utils/api'
+import store from '../../utils/store'
+import interconn from '../../utils/interconn'
+import { formatTime, messagePreview, nowTimeString, initial } from '../../utils/format'
+
+let messageHandler = null
+let dialogsPageHandler = null
+let dialogsErrorHandler = null
+let dialogsInvalidatedHandler = null
+
+export default {
+  data: {
+    nowTime: '',
+    dialogs: [],
+    loading: false,
+    hasMore: false,
+    _cursor: null,
+    _timer: null
+  },
+
+  onInit() {
+    const app = this.$app && this.$app.$def
+    if (!api.attachApp(app)) interconn.init()
+    store.attachApp(app)
+    this._cursor = null
+    // 初始用 store 中的数据填充（页面间返回时立即显示）
+    const stored = store.get('dialogs') || []
+    this.dialogs = stored.map(this._mapDialog)
+    this._setupMessageHandler()
+  },
+
+  onShow() {
+    this.updateTime()
+    // 每秒刷新时间（对齐 ebook 时钟）
+    if (this._timer) clearInterval(this._timer)
+    this._timer = setInterval(() => this.updateTime(), 1000)
+    // 若列表为空则拉取
+    if (this.dialogs.length === 0 || store.get('dialogsDirty')) {
+      this.loadDialogs(true)
+    }
+  },
+
+  onHide() {
+    if (this._timer) {
+      clearInterval(this._timer)
+      this._timer = null
+    }
+  },
+
+  onDestroy() {
+    if (this._timer) {
+      clearInterval(this._timer)
+      this._timer = null
+    }
+    if (messageHandler) {
+      messageHandler()
+      messageHandler = null
+    }
+    if (dialogsPageHandler) { dialogsPageHandler(); dialogsPageHandler = null }
+    if (dialogsErrorHandler) { dialogsErrorHandler(); dialogsErrorHandler = null }
+    if (dialogsInvalidatedHandler) { dialogsInvalidatedHandler(); dialogsInvalidatedHandler = null }
+  },
+
+  updateTime() {
+    this.nowTime = nowTimeString()
+  },
+
+  _setupMessageHandler() {
+    if (messageHandler) messageHandler()
+    if (dialogsPageHandler) dialogsPageHandler()
+    if (dialogsErrorHandler) dialogsErrorHandler()
+    if (dialogsInvalidatedHandler) dialogsInvalidatedHandler()
+    messageHandler = api.on('update.newMessage', (data) => {
+      if (!data || !data.dialog) return
+      // 更新列表中已有会话或插入新的
+      const all = store.get('dialogs') || []
+      const idx = all.findIndex(d => d.peer === data.dialog.peer)
+      if (idx >= 0) {
+        all[idx] = data.dialog
+        // 移到顶部
+        const item = all.splice(idx, 1)[0]
+        all.unshift(item)
+      } else {
+        all.unshift(data.dialog)
+      }
+      // 重新映射前 30 条
+      this.dialogs = all.slice(0, 30).map(this._mapDialog)
+    })
+    dialogsPageHandler = api.on('update.dialogsPage', data => {
+      if (!data || !Array.isArray(data.dialogs)) return
+      data.dialogs.forEach(dialog => store.upsertDialog(dialog))
+      store.set('dialogsDirty', false)
+      this.dialogs = (store.get('dialogs') || []).slice(0, 30).map(this._mapDialog)
+      this.hasMore = !!data.has_more
+      this._cursor = data.next_cursor || null
+    })
+    dialogsErrorHandler = api.on('update.dialogsError', data => {
+      if (data && data.message) this.showToast('同步失败：' + data.message)
+    })
+    dialogsInvalidatedHandler = api.on('update.dialogsInvalidated', () => {
+      store.set('dialogsDirty', true)
+      if (!this.loading) this.loadDialogs(true)
+    })
+  },
+
+  _mapDialog(d) {
+    return {
+      peer: d.peer,
+      title: d.title || '未知',
+      preview: messagePreview(d.last_message),
+      timeText: formatTime(d.last_message_date),
+      unread_count: d.unread_count || 0,
+      initial: initial(d.title),
+      pinned: !!d.pinned,
+      muted: !!d.muted
+    }
+  },
+
+  async loadDialogs(reset) {
+    if (this.loading) return
+    this.loading = true
+    try {
+      if (reset) {
+        this._cursor = null
+        store.clearDialogs()
+      }
+      const result = await api.getDialogs(30, this._cursor)
+      const list = (result && result.dialogs) || []
+      list.forEach(d => store.upsertDialog(d))
+      const all = store.get('dialogs') || []
+      this.dialogs = all.slice(0, 30).map(this._mapDialog)
+      this.hasMore = !!result.has_more
+      this._cursor = result.next_cursor || this._cursor
+    } catch (e) {
+      this.showToast((e && e.msg) || '加载失败')
+    } finally {
+      this.loading = false
+    }
+  },
+
+  loadMore() {
+    this.loadDialogs(false)
+  },
+
+  openChat(item) {
+    const router = require('@system.router')
+    router.push({
+      uri: 'pages/chat',
+      params: { peer: item.peer, title: item.title }
+    })
+  },
+
+  openSetting() {
+    const router = require('@system.router')
+    router.push({ uri: 'pages/setting' })
+  },
+
+  showToast(msg) {
+    const prompt = require('@system.prompt')
+    prompt.showToast({ message: msg, duration: 1500 })
+  }
+}
+</script>

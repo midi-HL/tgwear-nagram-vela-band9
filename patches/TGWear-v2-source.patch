@@ -1,0 +1,3404 @@
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/BridgeRouter.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/BridgeRouter.java
+@@ -24,7 +24,15 @@
+ import org.telegram.tgwear.handlers.PeersHandler;
+ 
+ import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.ArrayDeque;
++import java.util.Queue;
+ import java.util.Map;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
+ 
+ public class BridgeRouter {
+ 
+@@ -49,11 +57,31 @@
+ 
+     /** 处理线程独立，避免阻塞主线程 */
+     @NonNull
+-    private final java.util.concurrent.ExecutorService executor =
+-        java.util.concurrent.Executors.newSingleThreadExecutor();
++    private final java.util.concurrent.ExecutorService executor = new ThreadPoolExecutor(1, 1, 0L,
++        TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(32), r -> {
++            Thread thread = new Thread(r, "TGWear-router");
++            thread.setDaemon(true);
++            return thread;
++        }, new ThreadPoolExecutor.AbortPolicy());
++    private final Object responseLock = new Object();
++    private final Object eventLock = new Object();
++    private final Queue<String> pendingEvents = new ArrayDeque<>();
++    private static final int MAX_PENDING_EVENTS = 64;
++    private final ScheduledExecutorService eventFlushExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
++        Thread thread = new Thread(r, "TGWear-event-flush");
++        thread.setDaemon(true);
++        return thread;
++    });
++    private final LinkedHashMap<String, String> responseCache = new LinkedHashMap<String, String>(128, 0.75f, true) {
++        @Override protected boolean removeEldestEntry(Map.Entry<String, String> eldest) { return size() > 128; }
++    };
++    private final LinkedHashMap<String, String> operationCache = new LinkedHashMap<String, String>(128, 0.75f, true) {
++        @Override protected boolean removeEldestEntry(Map.Entry<String, String> eldest) { return size() > 128; }
++    };
+ 
+     public BridgeRouter(@NonNull WearConnection connection) {
+         this.connection = connection;
++        eventFlushExecutor.scheduleAtFixedRate(this::flushPendingEvents, 500, 500, TimeUnit.MILLISECONDS);
+ 
+         // 注册 handlers
+         // 基础
+@@ -71,13 +99,13 @@
+             return result;
+         });
+         // 会话
+-        register(WearConstants.Method.DIALOGS_GET,           new DialogsHandler.GetDialogsHandler());
++        register(WearConstants.Method.DIALOGS_GET,           new DialogsHandler.GetDialogsHandler(this));
+         register(WearConstants.Method.DIALOGS_PIN,           new DialogsHandler.PinHandler());
+         register(WearConstants.Method.DIALOGS_MUTE,          new DialogsHandler.MuteHandler());
+         register(WearConstants.Method.DIALOGS_ARCHIVE,       new DialogsHandler.ArchiveHandler());
+         register(WearConstants.Method.DIALOGS_DELETE,        new DialogsHandler.DeleteHandler());
+         // 消息
+-        register(WearConstants.Method.MESSAGES_GET_HISTORY,  new MessagesHandler.GetHistoryHandler());
++        register(WearConstants.Method.MESSAGES_GET_HISTORY,  new MessagesHandler.GetHistoryHandler(this));
+         register(WearConstants.Method.MESSAGES_SEND_TEXT,    new MessagesHandler.SendTextHandler());
+         register(WearConstants.Method.MESSAGES_REPLY,        new MessagesHandler.ReplyHandler());
+         register(WearConstants.Method.MESSAGES_EDIT,         new MessagesHandler.EditHandler());
+@@ -97,26 +125,35 @@
+ 
+     /** 处理一帧来自手表的 JSON 字符串 */
+     public void handle(@NonNull final String raw) {
+-        executor.execute(() -> {
++        try { executor.execute(() -> {
+             try {
+                 JSONObject req = new JSONObject(raw);
+-                // 必须有 RPC 标记且带 id（否则忽略）
+-                if (!req.has(WearConstants.RPC_MARKER)) {
+-                    Log.d(TAG, "non-rpc message ignored: " + truncate(raw, 200));
+-                    return;
+-                }
+-                if (!req.has(WearConstants.FIELD_ID)) {
+-                    Log.w(TAG, "rpc request without id: " + truncate(raw, 200));
+-                    return;
+-                }
+-                long id = req.getLong(WearConstants.FIELD_ID);
++                if (!req.optBoolean(WearConstants.RPC_MARKER, false) || !req.has(WearConstants.FIELD_ID)) return;
++                Object id = req.get(WearConstants.FIELD_ID);
++                if (!(id instanceof String) && !(id instanceof Number)) return;
++                String requestId = String.valueOf(id);
++                if (requestId.length() > 96) return;
++                String cached;
++                synchronized (responseLock) { cached = responseCache.get(requestId); }
++                if (cached != null) { connection.send(cached); return; }
+                 String method = req.optString(WearConstants.FIELD_METHOD, "");
+                 JSONObject params = req.optJSONObject(WearConstants.FIELD_PARAMS);
++                String operationId = params == null ? "" : params.optString("operation_id", "");
++                if (operationId.length() > 96) operationId = "";
++                if (!operationId.isEmpty()) {
++                    String prior;
++                    synchronized (responseLock) { prior = operationCache.get(operationId); }
++                    if (prior != null) {
++                        JSONObject replay = new JSONObject(prior);
++                        replay.put(WearConstants.FIELD_ID, id);
++                        cacheAndSend(requestId, replay.toString());
++                        return;
++                    }
++                }
+ 
+                 Handler h = handlers.get(method);
+                 if (h == null) {
+-                    sendError(id, WearConstants.Code.METHOD_NOT_FOUND,
+-                              "method not found: " + method);
++                    sendError(requestId, id, WearConstants.Code.METHOD_NOT_FOUND, "method not found: " + method);
+                     return;
+                 }
+ 
+@@ -124,38 +161,40 @@
+                 try {
+                     result = h.handle(params);
+                 } catch (RpcException e) {
+-                    sendError(id, e.code, e.getMessage());
++                    sendError(requestId, id, e.code, e.getMessage());
+                     return;
+                 } catch (Throwable t) {
+-                    Log.e(TAG, "handler " + method + " failed", t);
+-                    sendError(id, WearConstants.Code.INTERNAL_ERROR,
+-                              "internal: " + t.getMessage());
++                    Log.e(TAG, "handler failed method=" + method, t);
++                    sendError(requestId, id, WearConstants.Code.INTERNAL_ERROR, "internal: " + t.getMessage());
+                     return;
+                 }
+ 
+-                sendResult(id, result);
++                sendResult(requestId, id, result, operationId);
+             } catch (JSONException e) {
+-                Log.w(TAG, "parse failed: " + truncate(raw, 200), e);
++                Log.w(TAG, "request parse failed bytes=" + raw.length(), e);
+             }
+-        });
++        }); } catch (RuntimeException rejected) {
++            Log.e(TAG, "router queue full; incoming request rejected", rejected);
++        }
+     }
+ 
+     /** 发送 RPC 成功响应 */
+-    public void sendResult(long id, @Nullable Object result) {
++    private void sendResult(String requestId, Object id, @Nullable Object result, String operationId) {
+         try {
+             JSONObject resp = new JSONObject();
+             resp.put(WearConstants.FIELD_ID, id);
+             // 用 toJSON 把对象转成 JSON（用 TdJsonConverter 统一处理）
+             Object json = TdJsonConverter.toJSON(result);
+             resp.put(WearConstants.FIELD_RESULT, json);
+-            connection.send(resp.toString());
++            if (!operationId.isEmpty()) synchronized (responseLock) { operationCache.put(operationId, resp.toString()); }
++            cacheAndSend(requestId, resp.toString());
+         } catch (Throwable t) {
+             Log.e(TAG, "sendResult failed for id=" + id, t);
+         }
+     }
+ 
+     /** 发送 RPC 错误响应 */
+-    public void sendError(long id, int code, @Nullable String msg) {
++    private void sendError(String requestId, Object id, int code, @Nullable String msg) {
+         try {
+             JSONObject resp = new JSONObject();
+             resp.put(WearConstants.FIELD_ID, id);
+@@ -163,9 +202,14 @@
+             err.put(WearConstants.FIELD_CODE, code);
+             err.put(WearConstants.FIELD_MSG, msg == null ? "" : msg);
+             resp.put(WearConstants.FIELD_ERROR, err);
+-            connection.send(resp.toString());
++            cacheAndSend(requestId, resp.toString());
+         } catch (JSONException ignore) {
+         }
++    }
++
++    private void cacheAndSend(String requestId, String response) {
++        synchronized (responseLock) { responseCache.put(requestId, response); }
++        if (!connection.send(response)) Log.w(TAG, "response queued while TGW session unavailable id=" + requestId);
+     }
+ 
+     /** 推送事件到手表端（单向） */
+@@ -175,14 +219,34 @@
+             msg.put(WearConstants.EVENT_MARKER, true);
+             msg.put(WearConstants.FIELD_EVENT, event);
+             msg.put(WearConstants.FIELD_DATA, TdJsonConverter.toJSON(data));
+-            connection.send(msg.toString());
++            String encoded = msg.toString();
++            synchronized (eventLock) {
++                if (pendingEvents.isEmpty() && connection.send(encoded)) return;
++                if (pendingEvents.size() >= MAX_PENDING_EVENTS) {
++                    pendingEvents.poll();
++                    Log.w(TAG, "pending wearable event queue full; oldest event dropped");
++                }
++                pendingEvents.offer(encoded);
++            }
+         } catch (Throwable t) {
+             Log.e(TAG, "pushEvent " + event + " failed", t);
+         }
+     }
+ 
++    public void flushPendingEvents() {
++        synchronized (eventLock) {
++            while (!pendingEvents.isEmpty()) {
++                if (!connection.send(pendingEvents.peek())) return;
++                pendingEvents.poll();
++            }
++        }
++    }
++
+     public void shutdown() {
+         executor.shutdown();
++        eventFlushExecutor.shutdownNow();
++        synchronized (responseLock) { responseCache.clear(); operationCache.clear(); }
++        synchronized (eventLock) { pendingEvents.clear(); }
+     }
+ 
+     /** RPC 异常 */
+@@ -194,8 +258,4 @@
+         }
+     }
+ 
+-    private static String truncate(String s, int max) {
+-        if (s == null) return "";
+-        return s.length() > max ? s.substring(0, max) + "..." : s;
+-    }
+ }
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/NotificationCenterBridge.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/NotificationCenterBridge.java
+@@ -18,9 +18,11 @@
+ 
+ import org.telegram.messenger.MessageObject;
+ import org.telegram.messenger.MessagesController;
++import org.telegram.messenger.DialogObject;
+ import org.telegram.messenger.NotificationCenter;
+ import org.telegram.messenger.UserConfig;
+ import org.telegram.tgnet.TLRPC;
++import org.telegram.tgwear.handlers.MessagesHandler;
+ 
+ import java.util.HashMap;
+ import java.util.List;
+@@ -81,6 +83,7 @@
+     private void handleNewMessages(Object[] args) {
+         if (args == null || args.length < 2 || !(args[0] instanceof Number) || !(args[1] instanceof List)) return;
+         long dialogId = ((Number) args[0]).longValue();
++        if (!DialogObject.isUserDialog(dialogId)) return;
+         List<?> messages = (List<?>) args[1];
+         for (Object item : messages) {
+             if (!(item instanceof MessageObject)) continue;
+@@ -112,10 +115,17 @@
+         } else {
+             return;
+         }
++        if (!DialogObject.isUserDialog(peer)) return;
+         HashMap<String, Object> data = new HashMap<>();
+         data.put("peer", TdJsonConverter.peerToString(peer, null));
+         data.put("local_id", oldId);
+         data.put("message_id", newId);
++        String peerString = TdJsonConverter.peerToString(peer, null);
++        String messageText = "";
++        if (args[2] instanceof TLRPC.Message) messageText = ((TLRPC.Message) args[2]).message;
++        else if (args[2] instanceof MessageObject) messageText = ((MessageObject) args[2]).messageOwner.message;
++        String operationId = MessagesHandler.takeOperationIdForLocalMessage(oldId, peerString, messageText == null ? "" : messageText);
++        if (operationId != null) data.put("operation_id", operationId);
+         // 附带最新消息内容，手环端可直接替换气泡内容
+         try {
+             if (args[2] instanceof TLRPC.Message) {
+@@ -139,14 +149,9 @@
+         }
+         if (pending.isEmpty()) return;
+         data.put("message_ids", pending);
+-        if (args[1] instanceof List) {
+-            List<?> channels = (List<?>) args[1];
+-            if (!channels.isEmpty() && channels.get(0) instanceof Number) {
+-                long channelId = ((Number) channels.get(0)).longValue();
+-                data.put("peer", TdJsonConverter.peerToString(-channelId, null));
+-            }
+-        }
+-        router.pushEvent(WearConstants.Event.MESSAGE_UPDATED, data);
++        // NotificationCenter only includes a channelId here, not a user dialog ID.
++        // Ask the currently open private chat to reload instead of deleting ambiguous IDs globally.
++        router.pushEvent(WearConstants.Event.MESSAGE_CACHE_INVALIDATED, data);
+     }
+ 
+     private long lastDialogsPush;
+@@ -155,6 +160,6 @@
+         long now = System.currentTimeMillis();
+         if (now - lastDialogsPush < DIALOGS_THROTTLE_MS) return;
+         lastDialogsPush = now;
+-        Log.d(TAG, "dialogs changed; Vela will refresh on next dialogs.get");
++        router.pushEvent(WearConstants.Event.DIALOGS_INVALIDATED, new HashMap<String, Object>());
+     }
+ }
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/StubWearConnection.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/StubWearConnection.java
+@@ -30,12 +30,13 @@
+     @Nullable
+     private OutgoingPrinter printer = data -> Log.i(TAG, "stub → watch: " + data);
+ 
+-    private volatile boolean ready = true; // stub 默认就绪
++    private volatile boolean ready; // diagnostic/test stub is offline unless a test explicitly toggles it
+ 
+     @Override
+     public void init() {
+-        Log.i(TAG, "init: stub connection ready");
+-        if (listener != null) listener.onReadyStateChanged(true, null);
++        ready = false;
++        Log.w(TAG, "init: offline test stub; Xiaomi SDK is unavailable");
++        if (listener != null) listener.onReadyStateChanged(false, "stub-offline");
+     }
+ 
+     @Override
+@@ -46,7 +47,7 @@
+     @Override
+     public boolean send(@NonNull String data) {
+         if (printer != null) printer.print(data);
+-        return true;
++        return false;
+     }
+ 
+     @Override
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/TdJsonConverter.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/TdJsonConverter.java
+@@ -42,6 +42,7 @@
+     @Nullable
+     public static Object toJSON(@Nullable Object o) {
+         if (o == null) return null;
++        if (o instanceof JSONObject || o instanceof JSONArray) return o;
+         if (o instanceof String || o instanceof Boolean || o instanceof Number) return o;
+         if (o instanceof Map) {
+             JSONObject jo = new JSONObject();
+@@ -114,6 +115,11 @@
+     /* === Dialog === */
+     @NonNull
+     public static JSONObject convertDialog(@NonNull TLRPC.Dialog dialog) {
++        return convertDialog(dialog, null);
++    }
++
++    @NonNull
++    public static JSONObject convertDialog(@NonNull TLRPC.Dialog dialog, @Nullable TLRPC.Message lastMessage) {
+         JSONObject j = new JSONObject();
+         try {
+             j.put("peer", peerToString(dialog.id, null));
+@@ -123,7 +129,10 @@
+             j.put("last_message_date", dialog.last_message_date);
+             MessageObject last = findCachedMessage(dialog.id, dialog.top_message);
+             j.put("last_message_id", dialog.top_message);
+-            j.put("last_message", last != null ? convertMessageObject(last) : new JSONObject());
++            JSONObject preview = lastMessage != null ? convertMessage(lastMessage, dialog.id)
++                    : (last != null ? convertMessageObject(last) : new JSONObject());
++            preview.put("text", truncate(preview.optString("text", ""), 160));
++            j.put("last_message", preview);
+             j.put("pinned", dialog.pinned);
+             j.put("folder_id", dialog.folder_id);
+             j.put("muted", isDialogMuted(dialog.id));
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/WearBridgeService.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/WearBridgeService.java
+@@ -54,9 +54,10 @@
+     @Override
+     public void onCreate() {
+         super.onCreate();
++        WearDiagnosticStatus.serviceStarted();
+         try {
+             // 1. Create the verified Xiaomi Wearable SDK transport.
+-            connection = createConnection();
++            connection = new ReliableWearConnection(createConnection());
+ 
+             // 2. 创建 Router
+             router = new BridgeRouter(connection);
+@@ -89,7 +90,6 @@
+             });
+ 
+             connection.init();
+-            WearDiagnosticStatus.serviceStarted();
+             Log.i(TAG, "WearBridgeService started");
+         } catch (Throwable t) {
+             WearDiagnosticStatus.error("桥接服务初始化失败", t);
+@@ -126,7 +126,8 @@
+     private void sendPhoneProbe() {
+         if (connection == null || router == null || !connection.isReady()) {
+             Log.w(TAG, "phone probe rejected: transport not ready");
+-            WearDiagnosticStatus.error("无法发起往返测试：手机消息监听尚未就绪", null);
++            WearDiagnosticStatus.protocolState(false, "无法发起测试：Xiaomi transport/TGW/2 session 尚未就绪");
++            WearDiagnosticStatus.stage("手机连接挑战暂不可用");
+             return;
+         }
+         String nonce = java.util.UUID.randomUUID().toString();
+@@ -166,7 +167,7 @@
+         try {
+             return new XiaomiWearConnection(this);
+         } catch (Throwable e) {
+-            Log.e(TAG, "Xiaomi Wearable SDK unavailable, fallback to StubWearConnection", e);
++            Log.e(TAG, "Xiaomi Wearable SDK unavailable; bridge remains offline", e);
+             WearDiagnosticStatus.sdkAvailable(false, e);
+             return new StubWearConnection();
+         }
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/WearConstants.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/WearConstants.java
+@@ -67,6 +67,13 @@
+         public static final String MESSAGE_SENT           = "update.messageSent";
+         /** 消息被编辑/删除，手环端据此刷新 */
+         public static final String MESSAGE_UPDATED        = "update.messageUpdated";
++        /** A page fetched from Telegram is returned asynchronously after the local cache response. */
++        public static final String HISTORY_PAGE            = "update.historyPage";
++        public static final String HISTORY_ERROR           = "update.historyError";
++        public static final String DIALOGS_PAGE             = "update.dialogsPage";
++        public static final String DIALOGS_ERROR            = "update.dialogsError";
++        public static final String DIALOGS_INVALIDATED      = "update.dialogsInvalidated";
++        public static final String MESSAGE_CACHE_INVALIDATED = "update.messageCacheInvalidated";
+     }
+ 
+     /** 错误码 */
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/WearDiagnosticStatus.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/WearDiagnosticStatus.java
+@@ -13,6 +13,13 @@
+     private static boolean serviceRunning;
+     private static boolean sdkAvailable;
+     private static boolean transportReady;
++    private static boolean protocolReady;
++    private static String protocolStage = "等待 TGW/2 握手";
++    private static long rxFrames;
++    private static long txFrames;
++    private static long rxLogicalMessages;
++    private static long lastProtocolFrameAt;
++    private static int protocolChunkBytes;
+     @Nullable private static Boolean permissionGranted;
+     @Nullable private static Boolean wearableAppInstalled;
+     private static String stage = "等待桥接服务";
+@@ -28,6 +35,14 @@
+ 
+     public static synchronized void serviceStarted() {
+         serviceRunning = true;
++        transportReady = false;
++        protocolReady = false;
++        protocolStage = "等待 TGW/2 握手";
++        rxFrames = 0;
++        txFrames = 0;
++        rxLogicalMessages = 0;
++        lastProtocolFrameAt = 0;
++        protocolChunkBytes = 0;
+         stage = "桥接服务已启动";
+         touch();
+     }
+@@ -35,6 +50,8 @@
+     public static synchronized void serviceStopped() {
+         serviceRunning = false;
+         transportReady = false;
++        protocolReady = false;
++        protocolStage = "服务停止";
+         stage = "桥接服务已停止";
+         touch();
+     }
+@@ -79,9 +96,33 @@
+ 
+     public static synchronized void transport(boolean ready, @Nullable String detail) {
+         transportReady = ready;
++        protocolReady = false;
++        protocolStage = ready ? "等待 TGW/2 握手" : "Xiaomi transport down";
+         stage = ready ? "手机端消息监听已就绪" : (detail == null ? "等待手环连接" : detail);
+         if (ready) lastError = "";
+         else if (detail != null) lastError = detail;
++        touch();
++    }
++
++    public static synchronized void protocolState(boolean ready, @Nullable String detail) {
++        protocolReady = ready;
++        protocolStage = detail == null ? (ready ? "TGW/2 ready" : "TGW/2 offline") : detail;
++        touch();
++    }
++
++    public static synchronized void protocolFrame(boolean incoming) {
++        if (incoming) rxFrames++; else txFrames++;
++        lastProtocolFrameAt = System.currentTimeMillis();
++        touch();
++    }
++
++    public static synchronized void protocolPayloadReceived() {
++        rxLogicalMessages++;
++        touch();
++    }
++
++    public static synchronized void protocolChunkBytes(int value) {
++        protocolChunkBytes = Math.max(0, Math.min(2048, value));
+         touch();
+     }
+ 
+@@ -89,6 +130,8 @@
+         stage = where == null ? "连接错误" : where;
+         lastError = describe(error);
+         transportReady = false;
++        protocolReady = false;
++        protocolStage = "连接错误";
+         touch();
+     }
+ 
+@@ -125,6 +168,13 @@
+         result.put("serviceRunning", serviceRunning);
+         result.put("sdkAvailable", sdkAvailable);
+         result.put("transportReady", transportReady);
++        result.put("protocolReady", protocolReady);
++        result.put("protocolStage", protocolStage);
++        result.put("rxFrames", rxFrames);
++        result.put("txFrames", txFrames);
++        result.put("rxLogicalMessages", rxLogicalMessages);
++        result.put("protocolChunkBytes", protocolChunkBytes);
++        result.put("lastProtocolFrameAt", format(lastProtocolFrameAt));
+         result.put("permissionGranted", permissionGranted);
+         result.put("wearableAppInstalled", wearableAppInstalled);
+         result.put("stage", stage);
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/handlers/DialogsHandler.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/handlers/DialogsHandler.java
+@@ -13,6 +13,8 @@
+ 
+ import org.json.JSONObject;
+ import org.telegram.messenger.MessagesController;
++import org.telegram.messenger.MessageObject;
++import org.telegram.messenger.DialogObject;
+ import org.telegram.messenger.UserConfig;
+ import org.telegram.tgnet.TLRPC;
+ import org.telegram.tgwear.BridgeRouter;
+@@ -29,12 +31,15 @@
+ 
+     /** 默认拉取主文件夹（folderId = 0）的会话。 */
+     public static class GetDialogsHandler implements BridgeRouter.Handler {
++        private final BridgeRouter router;
++        public GetDialogsHandler(@NonNull BridgeRouter router) { this.router = router; }
+ 
+         @NonNull
+         @Override
+         public Object handle(@Nullable JSONObject params) throws Exception {
+-            int limit = clamp(params != null ? params.optInt("limit", 30) : 30, 1, 100);
+-            long offsetId = params != null ? params.optLong("offset_id", 0) : 0;
++            int limit = clamp(params != null ? params.optInt("limit", 30) : 30, 1, 30);
++            JSONObject cursor = params == null ? null : params.optJSONObject("cursor");
++            int offset = cursor == null ? 0 : Math.max(0, cursor.optInt("cache_index", 0));
+             int folderId = params != null ? params.optInt("folder_id", 0) : 0;
+ 
+             int account = UserConfig.selectedAccount;
+@@ -47,20 +52,13 @@
+             }
+ 
+             List<TLRPC.Dialog> sorted = new ArrayList<>(source);
++            sorted.removeIf(dialog -> dialog == null || !DialogObject.isUserDialog(dialog.id));
+             java.util.Collections.sort(sorted, (a, b) -> {
+                 if (a.pinned != b.pinned) return a.pinned ? -1 : 1;
+                 return Long.compare(b.last_message_date, a.last_message_date);
+             });
+ 
+-            int start = 0;
+-            if (offsetId > 0) {
+-                for (int i = 0; i < sorted.size(); i++) {
+-                    if (sorted.get(i).top_message == offsetId) {
+-                        start = i + 1;
+-                        break;
+-                    }
+-                }
+-            }
++            int start = Math.min(offset, sorted.size());
+             int end = Math.min(start + limit, sorted.size());
+ 
+             List<Object> dialogs = new ArrayList<>();
+@@ -74,7 +72,10 @@
+ 
+             HashMap<String, Object> result = new HashMap<>();
+             result.put("dialogs", dialogs);
+-            result.put("has_more", end < sorted.size());
++            result.put("has_more", false); // Network cursor arrives only with update.dialogsPage.
++            result.put("next_cursor", null);
++            result.put("refreshing", true);
++            refreshDialogsFromServer(account, messages, limit, folderId, cursor, router);
+             return result;
+         }
+     }
+@@ -150,13 +151,88 @@
+         }
+     }
+ 
++    private static void refreshDialogsFromServer(int account, @NonNull MessagesController messages,
++                                                 int limit, int folderId, @Nullable JSONObject cursor,
++                                                 @NonNull BridgeRouter router) {
++        try {
++            TLRPC.TL_messages_getDialogs request = new TLRPC.TL_messages_getDialogs();
++            request.limit = limit;
++            request.exclude_pinned = true;
++            if (folderId != 0) { request.flags |= 2; request.folder_id = folderId; }
++            if (cursor == null || cursor.optString("peer", "").isEmpty()) {
++                request.offset_peer = new TLRPC.TL_inputPeerEmpty();
++            } else {
++                long dialogId = TdJsonConverter.peerToDialogId(cursor.optString("peer", ""));
++                TLRPC.InputPeer peer = messages.getInputPeer(dialogId);
++                if (peer == null || dialogId == 0) {
++                    pushDialogError(router, "invalid dialog pagination cursor");
++                    return;
++                }
++                request.offset_peer = peer;
++                request.offset_id = cursor.optInt("offset_id", 0);
++                request.offset_date = cursor.optInt("offset_date", 0);
++            }
++            org.telegram.tgnet.ConnectionsManager.getInstance(account).sendRequest(request, (response, error) -> {
++                if (error != null) {
++                    Log.w(TAG, "dialogs request failed: " + error.text);
++                    pushDialogError(router, error.text == null ? "dialogs request failed" : error.text);
++                    return;
++                }
++                if (!(response instanceof TLRPC.messages_Dialogs)) {
++                    pushDialogError(router, "unexpected Telegram dialogs response");
++                    return;
++                }
++                TLRPC.messages_Dialogs page = (TLRPC.messages_Dialogs) response;
++                messages.putUsers(page.users, false);
++                messages.putChats(page.chats, false);
++                HashMap<Long, TLRPC.Message> latest = new HashMap<>();
++                for (TLRPC.Message message : page.messages) {
++                    long dialogId = message.dialog_id != 0 ? message.dialog_id : MessageObject.getPeerId(message.peer_id);
++                    TLRPC.Message previous = latest.get(dialogId);
++                    if (previous == null || message.date > previous.date) latest.put(dialogId, message);
++                }
++                ArrayList<TLRPC.Dialog> eligible = new ArrayList<>();
++                for (TLRPC.Dialog dialog : page.dialogs) {
++                    if (dialog != null && DialogObject.isUserDialog(dialog.id)) eligible.add(dialog);
++                }
++                eligible.sort((a, b) -> Long.compare(b.last_message_date, a.last_message_date));
++                ArrayList<Object> output = new ArrayList<>();
++                for (TLRPC.Dialog dialog : eligible) output.add(TdJsonConverter.convertDialog(dialog, latest.get(dialog.id)));
++                HashMap<String, Object> event = new HashMap<>();
++                event.put("dialogs", output);
++                event.put("has_more", page.dialogs.size() >= limit);
++                if (!page.dialogs.isEmpty()) {
++                    TLRPC.Dialog last = page.dialogs.get(page.dialogs.size() - 1);
++                    HashMap<String, Object> next = new HashMap<>();
++                    next.put("peer", TdJsonConverter.peerToString(last.id, last));
++                    next.put("offset_id", last.top_message);
++                    next.put("offset_date", last.last_message_date);
++                    event.put("next_cursor", next);
++                } else {
++                    event.put("next_cursor", null);
++                }
++                router.pushEvent(WearConstants.Event.DIALOGS_PAGE, event);
++            });
++        } catch (Throwable error) {
++            Log.w(TAG, "dialogs request dispatch failed", error);
++            pushDialogError(router, error.getMessage() == null ? "dialogs request dispatch failed" : error.getMessage());
++        }
++    }
++
++    private static void pushDialogError(@NonNull BridgeRouter router, @NonNull String message) {
++        HashMap<String, Object> event = new HashMap<>();
++        event.put("message", message.length() > 120 ? message.substring(0, 120) : message);
++        router.pushEvent(WearConstants.Event.DIALOGS_ERROR, event);
++    }
++
+     private static long requireDialogId(@Nullable JSONObject params) throws BridgeRouter.RpcException {
+         if (params == null || !params.has("peer")) {
+             throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "peer required");
+         }
+-        long dialogId = TdJsonConverter.peerToDialogId(params.optString("peer", ""));
+-        if (dialogId == 0) {
+-            throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "bad peer");
++        String peer = params.optString("peer", "");
++        long dialogId = TdJsonConverter.peerToDialogId(peer);
++        if (!peer.startsWith("user:") || dialogId <= 0) {
++            throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "private user peer required");
+         }
+         return dialogId;
+     }
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/handlers/MessagesHandler.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/handlers/MessagesHandler.java
+@@ -30,21 +30,32 @@
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
+ 
+ public class MessagesHandler {
+     private static final String TAG = "TGWear/Messages";
++    private static final ConcurrentHashMap<Integer, String> pendingOperationIds = new ConcurrentHashMap<>();
++    private static final ConcurrentHashMap<String, ConcurrentLinkedQueue<String>> pendingOperationsByText = new ConcurrentHashMap<>();
+ 
+     /* ============================ 历史 ============================ */
+ 
+     public static class GetHistoryHandler implements BridgeRouter.Handler {
++        private final BridgeRouter router;
++        public GetHistoryHandler(@NonNull BridgeRouter router) { this.router = router; }
++
+         @NonNull @Override public Object handle(@Nullable JSONObject params) throws Exception {
+             if (params == null || !params.has("peer")) {
+                 throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "peer required");
+             }
+             String peer = params.getString("peer");
+-            int limit = clamp(params.optInt("limit", 30), 1, 100);
++            int limit = clamp(params.optInt("limit", 6), 1, 6);
+             long offsetId = params.optLong("offset_id", 0);
++            if (!peer.startsWith("user:")) {
++                throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "TG Wear currently syncs private user chats only");
++            }
+             long dialogId = requireDialogId(peer);
++            if (dialogId <= 0) throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "private user peer required");
+ 
+             int account = UserConfig.selectedAccount;
+             MessagesController messages = MessagesController.getInstance(account);
+@@ -53,9 +64,10 @@
+             HashMap<String, Object> response = new HashMap<>();
+             response.put("messages", result);
+             response.put("has_more", result.size() >= limit);
+-
+-            // 异步刷新服务器历史，下一次请求即可看到更新的缓存
+-            refreshHistoryFromServer(account, messages, dialogId, limit, offsetId);
++            response.put("refreshing", true);
++
++            // A real network response is asynchronously returned as an event; do not silently discard it.
++            refreshHistoryFromServer(account, messages, dialogId, peer, limit, offsetId, router);
+             return response;
+         }
+     }
+@@ -67,10 +79,12 @@
+             if (params == null) throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "params required");
+             String peer = params.optString("peer", "");
+             String text = params.optString("text", "");
++            String operationId = params.optString("operation_id", "");
+             long replyTo = params.optLong("reply_to", 0);
+             if (peer.isEmpty() || text.isEmpty()) {
+                 throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "peer and text required");
+             }
++            if (text.length() > 2000) throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "text too long");
+             long dialogId = requireDialogId(peer);
+             AccountInstance accountInstance = AccountInstance.getInstance(UserConfig.selectedAccount);
+             MessagesController messages = accountInstance.getMessagesController();
+@@ -78,12 +92,23 @@
+                 throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "inputPeer unavailable");
+             }
+             MessageObject reply = findReplyMessage(messages, dialogId, replyTo);
++            if (!operationId.isEmpty()) enqueueOperation(peer, text, operationId);
+             accountInstance.getSendMessagesHelper().sendMessage(
+                     SendMessagesHelper.SendMessageParams.of(text, dialogId, reply, null, null,
+                             true, null, null, null, true, 0, 0, null, false));
+ 
+-            HashMap<String, Object> response = new HashMap<>();
+-            response.put("message", optimisticMessage(peer, text, replyTo));
++            int localId = findRecentLocalOutgoing(messages, dialogId, text);
++            if (localId < 0 && !operationId.isEmpty()) {
++                removeQueuedOperation(peer, text, operationId);
++                pendingOperationIds.put(localId, operationId);
++                if (pendingOperationIds.size() > 128) {
++                    Integer oldest = pendingOperationIds.keySet().iterator().next();
++                    pendingOperationIds.remove(oldest);
++                }
++            }
++
++            HashMap<String, Object> response = new HashMap<>();
++            response.put("message", optimisticMessage(peer, text, replyTo, localId, operationId));
+             response.put("pending", true);
+             return response;
+         }
+@@ -290,7 +315,8 @@
+ 
+     /** 异步拉取服务器历史以刷新本地缓存（读操作，失败不影响本次响应）。 */
+     private static void refreshHistoryFromServer(int account, @NonNull MessagesController messages,
+-                                                 long dialogId, int limit, long offsetId) {
++                                                 long dialogId, @NonNull String peer, int limit, long offsetId,
++                                                 @NonNull BridgeRouter router) {
+         try {
+             TLRPC.InputPeer inputPeer = messages.getInputPeer(dialogId);
+             if (inputPeer == null) return;
+@@ -302,8 +328,38 @@
+             req.add_offset = 0;
+             req.max_id = 0;
+             req.min_id = 0;
+-            org.telegram.tgnet.ConnectionsManager.getInstance(account).sendRequest(req, (ignored, error) -> {
+-                if (error != null) Log.w(TAG, "history refresh failed: " + error.text);
++            org.telegram.tgnet.ConnectionsManager.getInstance(account).sendRequest(req, (response, error) -> {
++                if (error != null) {
++                    Log.w(TAG, "history request failed: " + error.text);
++                    HashMap<String, Object> event = new HashMap<>();
++                    event.put("peer", peer);
++                    event.put("offset_id", offsetId);
++                    event.put("message", error.text == null ? "history request failed" : error.text);
++                    router.pushEvent(WearConstants.Event.HISTORY_ERROR, event);
++                    return;
++                }
++                if (!(response instanceof TLRPC.messages_Messages)) {
++                    HashMap<String, Object> event = new HashMap<>();
++                    event.put("peer", peer);
++                    event.put("offset_id", offsetId);
++                    event.put("message", "unexpected Telegram history response");
++                    router.pushEvent(WearConstants.Event.HISTORY_ERROR, event);
++                    return;
++                }
++                TLRPC.messages_Messages page = (TLRPC.messages_Messages) response;
++                messages.putUsers(page.users, false);
++                messages.putChats(page.chats, false);
++                ArrayList<TLRPC.Message> ordered = new ArrayList<>(page.messages);
++                ordered.sort((a, b) -> Integer.compare(a.date, b.date));
++                ArrayList<Object> converted = new ArrayList<>();
++                for (TLRPC.Message message : ordered) converted.add(TdJsonConverter.convertMessage(message, dialogId));
++                HashMap<String, Object> event = new HashMap<>();
++                event.put("peer", peer);
++                event.put("offset_id", offsetId);
++                event.put("messages", converted);
++                event.put("has_more", page.messages.size() >= limit);
++                event.put("next_offset_id", page.messages.isEmpty() ? offsetId : page.messages.stream().mapToInt(m -> m.id).min().orElse(0));
++                router.pushEvent(WearConstants.Event.HISTORY_PAGE, event);
+             });
+         } catch (Throwable error) {
+             Log.w(TAG, "history refresh dispatch failed", error);
+@@ -320,21 +376,67 @@
+     /** 本地乐观回显：手环端先看到"发送中"，服务端回包后会推送 update。 */
+     @NonNull
+     private static HashMap<String, Object> optimisticMessage(@NonNull String peer,
+-                                                             @NonNull String text, long replyTo) {
++                                                             @NonNull String text, long replyTo,
++                                                             int localId, @NonNull String operationId) {
+         HashMap<String, Object> message = new HashMap<>();
+         long now = System.currentTimeMillis();
+-        message.put("id", -now);
++        message.put("id", localId < 0 ? localId : -now);
+         message.put("out", true);
+         message.put("text", text);
+         message.put("date", now / 1000);
+         message.put("peer", peer);
+         message.put("sending", true);
++        if (!operationId.isEmpty()) message.put("operation_id", operationId);
+         if (replyTo != 0) {
+             HashMap<String, Object> reply = new HashMap<>();
+             reply.put("id", replyTo);
+             message.put("reply_to", reply);
+         }
+         return message;
++    }
++
++    @Nullable public static String takeOperationIdForLocalMessage(int localId, @NonNull String peer, @NonNull String text) {
++        String operationId = pendingOperationIds.remove(localId);
++        if (operationId != null) return operationId;
++        ConcurrentLinkedQueue<String> queue = pendingOperationsByText.get(peer + "\n" + text);
++        if (queue == null) return null;
++        operationId = queue.poll();
++        if (queue.isEmpty()) pendingOperationsByText.remove(peer + "\n" + text, queue);
++        return operationId;
++    }
++
++    private static void enqueueOperation(@NonNull String peer, @NonNull String text, @NonNull String operationId) {
++        String key = peer + "\n" + text;
++        ConcurrentLinkedQueue<String> queue = pendingOperationsByText.computeIfAbsent(key, unused -> new ConcurrentLinkedQueue<>());
++        queue.offer(operationId);
++        while (queue.size() > 8) queue.poll();
++        while (pendingOperationsByText.size() > 128) {
++            String first = pendingOperationsByText.keySet().iterator().next();
++            pendingOperationsByText.remove(first);
++        }
++    }
++
++    private static void removeQueuedOperation(String peer, String text, String operationId) {
++        String key = peer + "\n" + text;
++        ConcurrentLinkedQueue<String> queue = pendingOperationsByText.get(key);
++        if (queue != null) {
++            queue.remove(operationId);
++            if (queue.isEmpty()) pendingOperationsByText.remove(key, queue);
++        }
++    }
++
++    private static int findRecentLocalOutgoing(@NonNull MessagesController messages, long dialogId, @NonNull String text) {
++        try {
++            ArrayList<MessageObject> cached = messages.dialogMessage.get(dialogId);
++            if (cached == null) return 0;
++            for (int i = cached.size() - 1; i >= 0; i--) {
++                MessageObject message = cached.get(i);
++                if (message != null && message.getId() < 0 && message.isOut()
++                        && text.equals(message.messageOwner.message)
++                        && !pendingOperationIds.containsKey(message.getId())) return message.getId();
++            }
++        } catch (Throwable error) { Log.w(TAG, "unable to correlate local outgoing message"); }
++        return 0;
+     }
+ 
+     /**
+@@ -342,8 +444,11 @@
+      * 不合法时抛 RpcException，避免把 0 传给 Telegram。
+      */
+     private static long requireDialogId(@NonNull String peer) throws BridgeRouter.RpcException {
++        if (!peer.startsWith("user:")) {
++            throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "TG Wear currently supports private user chats only");
++        }
+         long dialogId = TdJsonConverter.peerToDialogId(peer);
+-        if (dialogId == 0) throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "bad peer: " + peer);
++        if (dialogId <= 0) throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "bad private peer");
+         return dialogId;
+     }
+ 
+--- a/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/handlers/PeersHandler.java
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/handlers/PeersHandler.java
+@@ -12,6 +12,7 @@
+ 
+ import org.json.JSONObject;
+ import org.telegram.messenger.MessagesController;
++import org.telegram.messenger.DialogObject;
+ import org.telegram.messenger.UserConfig;
+ import org.telegram.tgnet.TLRPC;
+ import org.telegram.tgwear.BridgeRouter;
+@@ -29,21 +30,17 @@
+             if (params == null || !params.has("peer")) {
+                 throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "peer required");
+             }
+-            long dialogId = TdJsonConverter.peerToDialogId(params.optString("peer", ""));
+-            if (dialogId == 0) {
+-                throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "bad peer");
++            String peer = params.optString("peer", "");
++            long dialogId = TdJsonConverter.peerToDialogId(peer);
++            if (!peer.startsWith("user:") || !DialogObject.isUserDialog(dialogId)) {
++                throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID, "private user peer required");
+             }
+             MessagesController messages = MessagesController.getInstance(UserConfig.selectedAccount);
+             HashMap<String, Object> result = new HashMap<>();
+             result.put("peer", params.optString("peer", ""));
+             try {
+-                if (dialogId > 0) {
+-                    TLRPC.User user = messages.getUser(dialogId);
+-                    if (user != null) result.put("user", TdJsonConverter.convertUser(user));
+-                } else {
+-                    TLRPC.Chat chat = messages.getChat(-dialogId);
+-                    if (chat != null) result.put("chat", TdJsonConverter.convertChat(chat));
+-                }
++                TLRPC.User user = messages.getUser(dialogId);
++                if (user != null) result.put("user", TdJsonConverter.convertUser(user));
+                 TLRPC.Dialog dialog = messages.getDialog(dialogId);
+                 if (dialog != null) result.put("dialog", TdJsonConverter.convertDialog(dialog));
+             } catch (Throwable t) {
+@@ -63,23 +60,18 @@
+     public static class PinMessageHandler implements BridgeRouter.Handler {
+         @NonNull @Override public Object handle(@Nullable JSONObject params) throws Exception {
+             if (params == null) throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "params required");
+-            long dialogId = TdJsonConverter.peerToDialogId(params.optString("peer", ""));
++            String peer = params.optString("peer", "");
++            long dialogId = TdJsonConverter.peerToDialogId(peer);
+             int messageId = params.optInt("message_id", 0);
+             boolean unpin = params.optBoolean("unpin", false);
+-            if (dialogId == 0 || messageId == 0) {
++            if (!peer.startsWith("user:") || !DialogObject.isUserDialog(dialogId) || messageId == 0) {
+                 throw new BridgeRouter.RpcException(WearConstants.Code.INVALID_PARAMS, "peer and message_id required");
+             }
+             MessagesController messages = MessagesController.getInstance(UserConfig.selectedAccount);
+             try {
+-                if (dialogId > 0) {
+-                    TLRPC.User user = messages.getUser(dialogId);
+-                    if (user == null) throw new IllegalStateException("user not cached");
+-                    messages.pinMessage(null, user, messageId, unpin, false, true);
+-                } else {
+-                    TLRPC.Chat chat = messages.getChat(-dialogId);
+-                    if (chat == null) throw new IllegalStateException("chat not cached");
+-                    messages.pinMessage(chat, null, messageId, unpin, false, true);
+-                }
++                TLRPC.User user = messages.getUser(dialogId);
++                if (user == null) throw new IllegalStateException("user not cached");
++                messages.pinMessage(null, user, messageId, unpin, false, true);
+             } catch (Throwable t) {
+                 Log.w(TAG, "pinMessage failed", t);
+                 throw new BridgeRouter.RpcException(WearConstants.Code.PEER_INVALID,
+--- a/tgwear-quickapp-main/src/app.ux
++++ b/tgwear-quickapp-main/src/app.ux
+@@ -3,80 +3,97 @@
+ import api from './utils/api'
+ import store from './utils/store'
+ 
++let removers = []
++
++function subscribe(event, handler) {
++  const remove = api.on(event, handler)
++  if (typeof remove === 'function') removers.push(remove)
++}
++
+ export default {
+-  async onCreate() {
+-    globalThis.conn = interconn
+-    globalThis.api = api
+-    globalThis.store = store
++  onCreate() {
++    // The app bundle owns the only transport, API dispatcher and store.
++    api.initializeRoot()
++    interconn.onState((state, info) => {
++      store.set('connectionState', state)
++      store.set('connectionStatus', info || null)
++      console.log('[TGWear] protocol state changed:', state)
++    })
+ 
+-    try {
+-      interconn.init()
+-      interconn.onState((state, info) => {
+-        console.log('[interconn] state:', state, info)
+-        store.set('connectionState', state)
+-      })
++    subscribe('update.newMessage', data => {
++      if (!data || !data.message || !data.peer) return
++      store.upsertMessage(data.peer, data.message)
++      if (data.dialog) store.upsertDialog(data.dialog)
++    })
++    subscribe('update.messageSent', data => {
++      if (!data || !data.peer) return
++      store.replaceMessageId(data.peer, data.local_id, data.message || {
++        id: data.message_id, out: true, sending: false, date: Math.floor(Date.now() / 1000)
++      }, data.operation_id)
++    })
++    subscribe('update.messageUpdated', data => {
++      if (data) store.removeMessages(data.peer || '', data.message_ids || [])
++    })
++    subscribe('update.dialogsPage', data => {
++      if (data && Array.isArray(data.dialogs)) data.dialogs.forEach(dialog => store.upsertDialog(dialog))
++    })
++    subscribe('update.dialogsError', data => {
++      if (data) console.warn('[dialogs] network refresh failed:', data.message || 'unknown')
++    })
++    subscribe('update.dialogsInvalidated', () => store.set('dialogsDirty', true))
++    subscribe('update.historyPage', data => {
++      if (!data || !data.peer || !Array.isArray(data.messages)) return
++      store.appendDialog(data.peer, data.messages, true)
++    })
++    subscribe('update.historyError', data => {
++      if (data) console.warn('[history] network refresh failed for peer:', data.peer || 'unknown')
++    })
++    subscribe('update.connectionState', data => {
++      if (data) store.set('connectionStatus', data)
++    })
++    subscribe('update.phoneProbe', data => {
++      if (!data || !data.nonce) return
++      store.set('connectionChallenge', data)
++      try {
++        const router = require('@system.router')
++        router.push({ uri: 'pages/connection', params: { nonce: data.nonce } })
++      } catch (e) { console.error('[connection] confirmation route failed') }
++    })
+ 
+-      // 加载设置
+-      await store.loadSettings()
++    // Load non-sensitive user preferences after all messages/events are subscribed.
++    store.loadSettings().catch(() => {})
++  },
+ 
+-      // 订阅手机端推送
+-      // 1) 新消息 / 被编辑的消息：Nagram 两者都走 didReceiveNewMessages，
+-      //    因此统一按 id 做 upsert（追加会导致编辑后出现重复气泡）。
+-      api.on('update.newMessage', (data) => {
+-        if (!data || !data.message) return
+-        try {
+-          store.upsertMessage(data.peer, data.message)
+-          if (data.dialog) store.upsertDialog(data.dialog)
+-        } catch (e) {
+-          console.error('[update.newMessage] handler error:', e)
+-        }
+-      })
++  bridgeInit() { return interconn.init() },
++  bridgeSend(data) { return interconn.send(data) },
++  bridgeGetReadyState() { return interconn.getReadyState() },
++  bridgeQueryReadyState() { return interconn.queryReadyState() },
++  bridgeDiagnose(timeout) { return interconn.diagnose(timeout) },
++  bridgeOnMessage(handler) { return interconn.onMessage(handler) },
++  bridgeOnState(handler) { return interconn.onState(handler) },
++  bridgeOnPhysicalState(handler) { return interconn.onPhysicalState(handler) },
++  bridgeProtocolSnapshot() { return interconn.protocolSnapshot() },
++  bridgeCall(method, params, options) { return api._call(method, params, options) },
++  bridgeOn(event, handler) { return api.on(event, handler) },
++  bridgeStoreGet(key) { return store.get(key) },
++  bridgeStoreSet(key, value) { return store.set(key, value) },
++  bridgeStoreGetDialog(peer) { return store.getDialog(peer) },
++  bridgeStoreAppendDialog(peer, messages, prepend) { return store.appendDialog(peer, messages, prepend) },
++  bridgeStoreUpsertMessage(peer, message) { return store.upsertMessage(peer, message) },
++  bridgeStoreReplaceMessageId(peer, localId, message, operationId) { return store.replaceMessageId(peer, localId, message, operationId) },
++  bridgeStoreRemoveMessages(peer, ids) { return store.removeMessages(peer, ids) },
++  bridgeStoreUpsertDialog(dialog) { return store.upsertDialog(dialog) },
++  bridgeStoreClearDialogs() { return store.clearDialogs() },
++  bridgeStoreClearSession() { return store.clearSession() },
++  bridgeStoreLoadSettings() { return store.loadSettings() },
++  bridgeStoreSaveSettings() { return store.saveSettings() },
++  bridgeStoreSnapshot() { return store.snapshot() },
+ 
+-      // 2) 出站消息拿到服务端 id：把本地乐观 id 替换为真实 id
+-      api.on('update.messageSent', (data) => {
+-        if (!data || !data.peer) return
+-        try {
+-          store.replaceMessageId(data.peer, data.local_id, data.message)
+-        } catch (e) {
+-          console.error('[update.messageSent] handler error:', e)
+-        }
+-      })
+-
+-      // 3) 消息被删除
+-      api.on('update.messageUpdated', (data) => {
+-        if (!data || !data.peer) return
+-        try {
+-          store.removeMessages(data.peer, data.message_ids || [])
+-        } catch (e) {
+-          console.error('[update.messageUpdated] handler error:', e)
+-        }
+-      })
+-
+-      // 4) 通道状态变化
+-      api.on('update.connectionState', (data) => {
+-        if (data && data.session) store.set('session', data.session)
+-      })
+-
+-      // 手机诊断页可发出一次性 nonce；手环端诊断页由用户确认后回传。
+-      api.on('update.phoneProbe', (data) => {
+-        if (!data || !data.nonce) return
+-        store.set('connectionChallenge', data)
+-        console.log('[connection] phone challenge received')
+-      })
+-    } catch (e) {
+-      console.error('[app.onCreate] error:', e)
+-    }
++  onDestroy() {
++    removers.forEach(remove => { try { remove() } catch (e) {} })
++    removers = []
+   },
+-  onDestroy() {
+-    console.log('[app] destroyed')
+-  },
+-  // 全局未捕获错误兜底
+-  onError(err) {
+-    console.error('[app.onError] uncaught:', err)
+-  },
+-  // 全局未处理的 Promise rejection
+-  onUnhandledRejection(data) {
+-    console.error('[app.onUnhandledRejection]:', data && (data.reason || data))
+-  }
++  onError(err) { console.error('[app] uncaught error:', err && err.message) },
++  onUnhandledRejection(data) { console.error('[app] unhandled rejection:', data && data.reason && data.reason.message) }
+ }
+ </script>
+--- a/tgwear-quickapp-main/src/manifest.json
++++ b/tgwear-quickapp-main/src/manifest.json
+@@ -1,8 +1,8 @@
+ {
+   "package": "com.hrk.tgwear",
+   "name": "TG Wear",
+-  "versionName": "0.1.0",
+-  "versionCode": 1,
++  "versionName": "0.1.4",
++  "versionCode": 5,
+   "minPlatformVersion": 1100,
+   "icon": "/common/icon.png",
+   "simulationVersion": "default",
+--- a/tgwear-quickapp-main/src/pages/chat/chat.ux
++++ b/tgwear-quickapp-main/src/pages/chat/chat.ux
+@@ -214,11 +214,15 @@
+ <script>
+ import api from '../../utils/api'
+ import store from '../../utils/store'
++import interconn from '../../utils/interconn'
+ import { nowTimeString, messageText } from '../../utils/format'
+ 
+ let messageHandler = null
+ let sentHandler = null
+ let updatedHandler = null
++let historyPageHandler = null
++let historyErrorHandler = null
++let invalidationHandler = null
+ 
+ export default {
+   data: {
+@@ -243,10 +247,14 @@
+     menuCanDelete: true,
+     // 内部
+     _offsetId: 0,
+-    _sending: false
++    _sending: false,
++    _operationId: ''
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
++    store.attachApp(app)
+     const router = require('@system.router')
+     const params = (router && router.getParams && router.getParams()) || {}
+     this.peer = params.peer || ''
+@@ -295,12 +303,18 @@
+     if (messageHandler) { messageHandler(); messageHandler = null }
+     if (sentHandler) { sentHandler(); sentHandler = null }
+     if (updatedHandler) { updatedHandler(); updatedHandler = null }
++    if (historyPageHandler) { historyPageHandler(); historyPageHandler = null }
++    if (historyErrorHandler) { historyErrorHandler(); historyErrorHandler = null }
++    if (invalidationHandler) { invalidationHandler(); invalidationHandler = null }
+   },
+ 
+   _setupHandlers() {
+     if (messageHandler) messageHandler()
+     if (sentHandler) sentHandler()
+     if (updatedHandler) updatedHandler()
++    if (historyPageHandler) historyPageHandler()
++    if (historyErrorHandler) historyErrorHandler()
++    if (invalidationHandler) invalidationHandler()
+ 
+     // 新消息 / 被编辑的消息
+     // 说明：Nagram 中「消息被编辑」同样走 didReceiveNewMessages，
+@@ -324,15 +338,17 @@
+     // 出站消息确认：local_id（负数）→ server id
+     sentHandler = api.on('update.messageSent', (data) => {
+       if (!data || data.peer !== this.peer) return
+-      const idx = this.messages.findIndex(m => m.id === data.local_id)
+-      if (idx < 0) return
++      const idx = this.messages.findIndex(m => String(m.id) === String(data.local_id)
++        || (!!data.operation_id && m.operation_id === data.operation_id))
+       if (data.message) {
+-        this.messages[idx] = this._mapMsg(data.message)
+-      } else {
++        if (idx >= 0) this.messages[idx] = this._mapMsg(data.message)
++        else this.messages.push(this._mapMsg(data.message))
++      } else if (idx >= 0) {
+         this.messages[idx].id = data.message_id
+         this.messages[idx].stateText = ''
+       }
+-      store.replaceMessageId(this.peer, data.local_id, data.message || null)
++      store.replaceMessageId(this.peer, data.local_id, data.message || null, data.operation_id)
++      this.messages.sort((a, b) => (Number(a.date) - Number(b.date)) || (Number(a.id) - Number(b.id)))
+     })
+ 
+     // 消息被删除
+@@ -348,6 +364,23 @@
+       this.messages = this.messages.filter(m => !idSet.has(m.id))
+       store.removeMessages(this.peer, ids)
+     })
++    historyPageHandler = api.on('update.historyPage', data => {
++      if (!data || data.peer !== this.peer || !Array.isArray(data.messages)) return
++      store.appendDialog(this.peer, data.messages, true)
++      this.messages = store.getDialog(this.peer).map(this._mapMsg)
++      this.hasMore = !!data.has_more
++      this._offsetId = Number(data.next_offset_id) || 0
++      this._scrollToBottom()
++    })
++    historyErrorHandler = api.on('update.historyError', data => {
++      if (data && data.peer === this.peer) this.showToast('同步历史失败：' + (data.message || '网络错误'))
++    })
++    invalidationHandler = api.on('update.messageCacheInvalidated', data => {
++      const ids = data && data.message_ids
++      if (Array.isArray(ids) && ids.some(id => this.messages.some(message => String(message.id) === String(id)))) {
++        this.loadHistory(true)
++      }
++    })
+   },
+ 
+   _mapMsg(m) {
+@@ -359,6 +392,7 @@
+       sender: m.out ? '' : (m.sender || ''),
+       text: messageText(m),
+       date: m.date,
++      operation_id: m.operation_id || '',
+       stateText: m.out ? (failed ? '发送失败' : (sending ? '发送中' : '')) : ''
+     }
+   },
+@@ -389,19 +423,11 @@
+       if (reset) this._offsetId = 0
+       const result = await api.getHistory(this.peer, 30, this._offsetId)
+       const list = (result && result.messages) || []
+-      // 手机端按时间正序返回，这里直接映射
+-      const mapped = list.map(this._mapMsg)
+-      if (reset) {
+-        this.messages = mapped
+-      } else {
+-        const existingIds = new Set(this.messages.map(m => m.id))
+-        const fresh = mapped.filter(m => !existingIds.has(m.id))
+-        this.messages = [...fresh, ...this.messages]
+-      }
+-      this.hasMore = list.length >= 30
+-      if (list.length > 0) {
+-        this._offsetId = list[0].id || 0
+-      }
++      // Merge with any network page that may have arrived before this cached RPC response.
++      if (list.length) store.appendDialog(this.peer, list, true)
++      this.messages = store.getDialog(this.peer).map(this._mapMsg)
++      this.hasMore = !!((result && result.has_more) || (result && result.refreshing))
++      if (list.length) this._offsetId = list[0].id || this._offsetId
+       if (reset) {
+         this._scrollToBottom()
+         this._markLastRead()
+@@ -431,6 +457,7 @@
+       return
+     }
+     this.draft += content
++    this._operationId = ''
+     // 节流上报"正在输入"（每 8 个字符一次），避免占用通道
+     if (this.draft.length % 8 === 1) {
+       api.setTyping(this.peer, 0).catch(() => {})
+@@ -440,6 +467,7 @@
+   onDelete() {
+     if (!this.draft) return
+     this.draft = this.draft.slice(0, -1)
++    this._operationId = ''
+   },
+ 
+   onVisibilityChange(evt) {
+@@ -460,9 +488,11 @@
+     }
+     this._sending = true
+     try {
++      if (!this._operationId) this._operationId = 'wear-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
++      const operationId = this._operationId
+       const result = this.replyTo
+-        ? await api.reply(this.peer, text, this.replyTo)
+-        : await api.sendText(this.peer, text, 0)
++        ? await api.reply(this.peer, text, this.replyTo, operationId)
++        : await api.sendText(this.peer, text, 0, operationId)
+       const msg = (result && result.message) || {
+         id: -Date.now(),
+         out: true,
+@@ -476,6 +506,7 @@
+       }
+       this.draft = ''
+       this.replyTo = 0
++      this._operationId = ''
+       this._scrollToBottom()
+     } catch (e) {
+       this.showToast((e && e.msg) || '发送失败')
+--- a/tgwear-quickapp-main/src/pages/chats/chats.ux
++++ b/tgwear-quickapp-main/src/pages/chats/chats.ux
+@@ -161,9 +161,13 @@
+ <script>
+ import api from '../../utils/api'
+ import store from '../../utils/store'
++import interconn from '../../utils/interconn'
+ import { formatTime, messagePreview, nowTimeString, initial } from '../../utils/format'
+ 
+ let messageHandler = null
++let dialogsPageHandler = null
++let dialogsErrorHandler = null
++let dialogsInvalidatedHandler = null
+ 
+ export default {
+   data: {
+@@ -171,12 +175,15 @@
+     dialogs: [],
+     loading: false,
+     hasMore: false,
+-    _offsetId: 0,
++    _cursor: null,
+     _timer: null
+   },
+ 
+   onInit() {
+-    this._offsetId = 0
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
++    store.attachApp(app)
++    this._cursor = null
+     // 初始用 store 中的数据填充（页面间返回时立即显示）
+     const stored = store.get('dialogs') || []
+     this.dialogs = stored.map(this._mapDialog)
+@@ -189,7 +196,7 @@
+     if (this._timer) clearInterval(this._timer)
+     this._timer = setInterval(() => this.updateTime(), 1000)
+     // 若列表为空则拉取
+-    if (this.dialogs.length === 0) {
++    if (this.dialogs.length === 0 || store.get('dialogsDirty')) {
+       this.loadDialogs(true)
+     }
+   },
+@@ -210,6 +217,9 @@
+       messageHandler()
+       messageHandler = null
+     }
++    if (dialogsPageHandler) { dialogsPageHandler(); dialogsPageHandler = null }
++    if (dialogsErrorHandler) { dialogsErrorHandler(); dialogsErrorHandler = null }
++    if (dialogsInvalidatedHandler) { dialogsInvalidatedHandler(); dialogsInvalidatedHandler = null }
+   },
+ 
+   updateTime() {
+@@ -218,6 +228,9 @@
+ 
+   _setupMessageHandler() {
+     if (messageHandler) messageHandler()
++    if (dialogsPageHandler) dialogsPageHandler()
++    if (dialogsErrorHandler) dialogsErrorHandler()
++    if (dialogsInvalidatedHandler) dialogsInvalidatedHandler()
+     messageHandler = api.on('update.newMessage', (data) => {
+       if (!data || !data.dialog) return
+       // 更新列表中已有会话或插入新的
+@@ -234,6 +247,21 @@
+       // 重新映射前 30 条
+       this.dialogs = all.slice(0, 30).map(this._mapDialog)
+     })
++    dialogsPageHandler = api.on('update.dialogsPage', data => {
++      if (!data || !Array.isArray(data.dialogs)) return
++      data.dialogs.forEach(dialog => store.upsertDialog(dialog))
++      store.set('dialogsDirty', false)
++      this.dialogs = (store.get('dialogs') || []).slice(0, 30).map(this._mapDialog)
++      this.hasMore = !!data.has_more
++      this._cursor = data.next_cursor || null
++    })
++    dialogsErrorHandler = api.on('update.dialogsError', data => {
++      if (data && data.message) this.showToast('同步失败：' + data.message)
++    })
++    dialogsInvalidatedHandler = api.on('update.dialogsInvalidated', () => {
++      store.set('dialogsDirty', true)
++      if (!this.loading) this.loadDialogs(true)
++    })
+   },
+ 
+   _mapDialog(d) {
+@@ -254,20 +282,16 @@
+     this.loading = true
+     try {
+       if (reset) {
+-        this._offsetId = 0
++        this._cursor = null
+         store.clearDialogs()
+       }
+-      const result = await api.getDialogs(30, this._offsetId)
++      const result = await api.getDialogs(30, this._cursor)
+       const list = (result && result.dialogs) || []
+       list.forEach(d => store.upsertDialog(d))
+       const all = store.get('dialogs') || []
+       this.dialogs = all.slice(0, 30).map(this._mapDialog)
+-      this.hasMore = list.length >= 30
+-      if (list.length > 0) {
+-        // 取最后一条作为下次偏移
+-        const last = list[list.length - 1]
+-        this._offsetId = last.last_message_id || 0
+-      }
++      this.hasMore = !!result.has_more
++      this._cursor = result.next_cursor || this._cursor
+     } catch (e) {
+       this.showToast((e && e.msg) || '加载失败')
+     } finally {
+--- a/tgwear-quickapp-main/src/pages/connection/connection.ux
++++ b/tgwear-quickapp-main/src/pages/connection/connection.ux
+@@ -46,6 +46,9 @@
+ import { nowTimeString } from '../../utils/format'
+ 
+ export default {
++  protected: {
++    nonce: ''
++  },
+   data: {
+     nowTime: '',
+     systemState: '正在读取',
+@@ -59,6 +62,13 @@
+     _timer: null,
+     _offState: null,
+     _busy: false
++  },
++  onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
++    store.attachApp(app)
++    this.challengeNonce = this.nonce || ''
++    this.challengePending = !!this.challengeNonce
+   },
+   onShow() {
+     this.updateTime()
+@@ -85,7 +95,7 @@
+   updateTime() { this.nowTime = nowTimeString() },
+   refreshChallenge() {
+     const challenge = store.get('connectionChallenge')
+-    this.challengeNonce = challenge && challenge.nonce ? challenge.nonce : ''
++    this.challengeNonce = this.nonce || (challenge && challenge.nonce ? challenge.nonce : '')
+     this.challengePending = !!this.challengeNonce
+     if (this.challengePending) this.roundTripText = '收到手机挑战，请点击确认'
+   },
+@@ -104,8 +114,10 @@
+         try {
+           const phone = await api.getBridgeStatus()
+           this.phoneServiceText = phone && phone.serviceRunning ? '运行中' : '未报告运行'
+-          this.phoneTransportText = phone && phone.transportReady ? '就绪' : '未就绪'
++          this.phoneTransportText = phone && phone.protocolReady ? 'TGW/2 已就绪' : (phone && phone.transportReady ? '物理监听在线，协议未握手' : '未就绪')
+           this.detail = '手机阶段：' + ((phone && phone.stage) || '未知')
++          if (phone && phone.protocolStage) this.detail += '；协议：' + phone.protocolStage
++          if (phone) this.detail += '；帧 收/发：' + (phone.rxFrames || 0) + '/' + (phone.txFrames || 0) + '；分块：' + (phone.protocolChunkBytes || 0) + 'B'
+           if (phone && phone.nodeId) this.detail += '；设备 ID：' + phone.nodeId
+           if (phone && phone.lastError) this.detail += '；' + phone.lastError
+         } catch (e) {
+@@ -136,6 +148,7 @@
+       if (result && result.ok) {
+         this.roundTripText = '手机↔手环双向通信成功'
+         this.challengePending = false
++        this.challengeNonce = ''
+         store.set('connectionChallenge', null)
+         this.detail = '手机已收到手环确认，双向应用消息往返通过。'
+       } else {
+--- a/tgwear-quickapp-main/src/pages/setting/setting.ux
++++ b/tgwear-quickapp-main/src/pages/setting/setting.ux
+@@ -43,7 +43,7 @@
+       <list-item class="item" @click="openAbout" type="about">
+         <div class="item-content">
+           <text class="itemtext">关于</text>
+-          <text class="itemtext2">版本 0.1.0</text>
++          <text class="itemtext2">版本 0.1.4</text>
+         </div>
+         <image src="/common/images/enter.png" static style="width:32px;height:32px;" />
+       </list-item>
+@@ -120,6 +120,7 @@
+ <script>
+ import store from '../../utils/store'
+ import api from '../../utils/api'
++import interconn from '../../utils/interconn'
+ import { nowTimeString } from '../../utils/format'
+ 
+ export default {
+@@ -132,6 +133,9 @@
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
++    store.attachApp(app)
+     this.refreshFromStore()
+   },
+ 
+@@ -205,7 +209,7 @@
+   },
+ 
+   openAbout() {
+-    this.showToast('TG Wear 0.1.0 | GPL v2')
++    this.showToast('TG Wear 0.1.4 | GPL v2')
+   },
+ 
+   openConnection() {
+--- a/tgwear-quickapp-main/src/pages/splash/splash.ux
++++ b/tgwear-quickapp-main/src/pages/splash/splash.ux
+@@ -52,6 +52,9 @@
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
++    store.attachApp(app)
+   },
+ 
+   onShow() {
+@@ -86,7 +89,7 @@
+     this.iconPath = '/common/images/empty.png'
+ 
+     try {
+-      const result = await interconn.diagnosis(8000)
++      const result = await interconn.diagnose(8000)
+       // status: 0=OK, 204=timeout, 1001=app not installed, 1000=others
+       if (result.status === 0) {
+         await this.checkAuth()
+--- a/tgwear-quickapp-main/src/utils/api.js
++++ b/tgwear-quickapp-main/src/utils/api.js
+@@ -1,138 +1,165 @@
+ import interconn from './interconn'
+ 
+-let seq = 0
+-const pending = new Map() // id -> {resolve, reject, timer}
+-const RPC_TIMEOUT = 30000
+-
+-// 简易事件总线
+-const listeners = {}
+-const eventBus = {
+-  on(event, handler) {
+-    (listeners[event] = listeners[event] || []).push(handler)
+-    return () => {
+-      listeners[event] = (listeners[event] || []).filter(h => h !== handler)
+-    }
+-  },
+-  emit(event, data) {
+-    (listeners[event] || []).forEach(h => {
+-      try { h(data) } catch (e) { console.warn('event handler error:', event, e) }
+-    })
++const root = typeof globalThis !== 'undefined' ? globalThis : global
++const ROOT_KEY = '__tgWearApiV2'
++if (!root[ROOT_KEY]) {
++  root[ROOT_KEY] = {
++    sequence: 0,
++    pending: Object.create(null),
++    listeners: Object.create(null),
++    facade: null,
++    removeTransportListener: null,
++    timeoutMs: 20000,
++    retryIntervalMs: 5000,
++    maxPending: 32
+   }
+ }
++const core = root[ROOT_KEY]
+ 
+-function call(method, params = {}) {
+-  const id = ++seq
+-  const req = { id, method, params }
++function failAll(error) {
++  Object.keys(core.pending).forEach(id => {
++    const item = core.pending[id]
++    clearTimeout(item.timer)
++    clearInterval(item.retryTimer)
++    delete core.pending[id]
++    item.reject(error)
++  })
++}
+ 
++function emit(event, data) {
++  const handlers = (core.listeners[event] || []).slice()
++  handlers.forEach(handler => {
++    try { handler(data) } catch (e) { console.warn('[api] event handler failed:', event) }
++  })
++}
++
++function receive(payload) {
++  if (!payload || typeof payload !== 'object') return
++  if (payload.id !== undefined && payload.__event !== true) {
++    const id = String(payload.id)
++    const item = core.pending[id]
++    if (!item) return
++    clearTimeout(item.timer)
++    clearInterval(item.retryTimer)
++    delete core.pending[id]
++    if (payload.error) item.reject(payload.error)
++    else item.resolve(payload.result)
++    return
++  }
++  if (payload.__event === true && typeof payload.event === 'string') emit(payload.event, payload.data)
++}
++
++function ensureTransportListener() {
++  if (core.removeTransportListener) return
++  core.removeTransportListener = interconn.onMessage(receive)
++  interconn.onState((state, info) => {
++    if (state !== 1) failAll({ code: -1006, msg: 'wearable session disconnected', detail: info })
++  })
++}
++
++function call(method, params = {}, options = {}) {
++  if (core.facade) return core.facade.bridgeCall(method, params, options)
++  ensureTransportListener()
++  interconn.init()
++  const id = 'v2-' + Date.now().toString(36) + '-' + (++core.sequence).toString(36)
++  const request = { __rpc: true, id, method, params }
++  if (options.operationId) request.operation_id = options.operationId
++  if (options.peer) request.peer = options.peer
+   return new Promise((resolve, reject) => {
++    if (Object.keys(core.pending).length >= core.maxPending) {
++      reject({ code: -2, msg: 'too many pending TG Wear requests' })
++      return
++    }
++    const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1000, Math.min(60000, options.timeoutMs)) : core.timeoutMs
+     const timer = setTimeout(() => {
+-      if (pending.has(id)) {
+-        pending.delete(id)
+-        reject({ code: -1, msg: 'rpc timeout', method })
+-      }
+-    }, RPC_TIMEOUT)
+-
+-    pending.set(id, { resolve, reject, timer })
+-
+-    interconn.send(req).catch(err => {
+-      clearTimeout(timer)
+-      pending.delete(id)
+-      reject(err)
++      if (!core.pending[id]) return
++      const item = core.pending[id]
++      delete core.pending[id]
++      clearInterval(item.retryTimer)
++      reject({ code: -1, msg: 'RPC timeout: ' + method, requestId: id })
++    }, timeoutMs)
++    let retries = 0
++    const retryTimer = setInterval(() => {
++      if (!core.pending[id] || retries >= 3) return
++      retries++
++      interconn.send(request).catch(error => {
++        if (core.pending[id]) console.warn('[api] idempotent RPC resend failed:', method, error && error.msg)
++      })
++    }, core.retryIntervalMs)
++    core.pending[id] = { resolve, reject, timer, retryTimer, method, operationId: options.operationId || '' }
++    interconn.send(request).catch(error => {
++      const item = core.pending[id]
++      if (!item) return
++      clearTimeout(item.timer)
++      clearInterval(item.retryTimer)
++      delete core.pending[id]
++      reject(error)
+     })
+   })
+ }
+ 
+-// 处理手机端 RPC 响应和事件推送
+-interconn.onMessage(payload => {
+-  if (!payload) return
+-  // RPC 响应
+-  if (payload.id !== undefined && payload.__rpc !== true) {
+-    const p = pending.get(payload.id)
+-    if (p) {
+-      clearTimeout(p.timer)
+-      pending.delete(payload.id)
+-      if (payload.error) p.reject(payload.error)
+-      else p.resolve(payload.result)
+-    }
+-    return
+-  }
+-  // 事件推送
+-  if (payload.__event === true) {
+-    eventBus.emit(payload.event, payload.data)
+-  }
+-})
+-
+-export default {
+-  // ==== 会话 ====
+-  getDialogs(limit = 30, offsetId = 0, folderId = 0) {
+-    return call('dialogs.get', { limit, offset_id: offsetId, folder_id: folderId })
++const api = {
++  attachApp(facade) {
++    if (!facade || typeof facade.bridgeCall !== 'function') return false
++    core.facade = facade
++    interconn.attachApp(facade)
++    return true
+   },
+-  pinDialog(peer, pin = true) {
+-    return call('dialogs.pin', { peer, pin })
++  initializeRoot() {
++    ensureTransportListener()
++    interconn.init()
++    return true
+   },
+-  muteDialog(peer, seconds = 0) {
+-    return call('dialogs.mute', { peer, seconds })
++  _call(method, params = {}, options = {}) { return call(method, params, options) },
++  on(event, handler) {
++    if (core.facade) return core.facade.bridgeOn(event, handler)
++    if (!event || typeof handler !== 'function') return () => {}
++    const list = core.listeners[event] || (core.listeners[event] = [])
++    if (list.indexOf(handler) < 0) list.push(handler)
++    return () => { core.listeners[event] = (core.listeners[event] || []).filter(item => item !== handler) }
+   },
+-  archiveDialog(peer, archive = true) {
+-    return call('dialogs.archive', { peer, archive })
++  _emit: emit,
++  _receive: receive,
++  snapshot() {
++    return { pending: Object.keys(core.pending).length, listeners: Object.keys(core.listeners).reduce((n, key) => n + core.listeners[key].length, 0) }
+   },
+-  deleteDialog(peer, onlyHistory = false) {
+-    return call('dialogs.delete', { peer, only_history: onlyHistory })
++  resetForTests() {
++    failAll({ code: -1, msg: 'reset' })
++    core.sequence = 0
++    core.listeners = Object.create(null)
+   },
+ 
+-  // ==== 消息 ====
+-  getHistory(peer, limit = 30, offsetId = 0) {
+-    return call('messages.getHistory', { peer, limit, offset_id: offsetId })
++  // Dialogs
++  getDialogs(limit = 30, cursor = null, folderId = 0) { return call('dialogs.get', { limit, cursor, folder_id: folderId }) },
++  pinDialog(peer, pin = true) { return call('dialogs.pin', { peer, pin }) },
++  muteDialog(peer, seconds = 0) { return call('dialogs.mute', { peer, seconds }) },
++  archiveDialog(peer, archive = true) { return call('dialogs.archive', { peer, archive }) },
++  deleteDialog(peer, onlyHistory = false, operationId) { return call('dialogs.delete', { peer, only_history: onlyHistory }, { operationId, peer }) },
++
++  // Messages
++  getHistory(peer, limit = 30, offsetId = 0) { return call('messages.getHistory', { peer, limit, offset_id: offsetId }, { peer }) },
++  sendText(peer, text, replyTo = 0, operationId) {
++    const op = operationId || ('op-' + Date.now().toString(36) + '-' + (++core.sequence).toString(36))
++    return call('messages.sendText', { peer, text, reply_to: replyTo, operation_id: op }, { operationId: op, peer })
+   },
+-  sendText(peer, text, replyTo = 0) {
+-    return call('messages.sendText', { peer, text, reply_to: replyTo })
++  reply(peer, text, replyTo, operationId) {
++    const op = operationId || ('op-' + Date.now().toString(36) + '-' + (++core.sequence).toString(36))
++    return call('messages.reply', { peer, text, reply_to: replyTo, operation_id: op }, { operationId: op, peer })
+   },
+-  reply(peer, text, replyTo) {
+-    return call('messages.reply', { peer, text, reply_to: replyTo })
+-  },
+-  editMessage(peer, messageId, text) {
+-    return call('messages.edit', { peer, message_id: messageId, text })
+-  },
+-  deleteMessage(peer, messageId, revoke = true) {
+-    return call('messages.delete', { peer, message_id: messageId, revoke })
+-  },
+-  forwardMessage(peer, messageId, toPeer) {
+-    return call('messages.forward', { peer, message_id: messageId, to_peer: toPeer })
+-  },
+-  searchMessages(peer, query, limit = 20) {
+-    return call('messages.search', { peer, query, limit })
+-  },
+-  setTyping(peer, action = 0) {
+-    return call('messages.setTyping', { peer, action })
+-  },
+-  markRead(peer, messageId) {
+-    return call('messages.markRead', { peer, max_id: messageId })
+-  },
++  editMessage(peer, messageId, text, operationId) { return call('messages.edit', { peer, message_id: messageId, text, operation_id: operationId }, { operationId, peer }) },
++  deleteMessage(peer, messageId, revoke = true, operationId) { return call('messages.delete', { peer, message_id: messageId, revoke, operation_id: operationId }, { operationId, peer }) },
++  forwardMessage(peer, messageId, toPeer, operationId) { return call('messages.forward', { peer, message_id: messageId, to_peer: toPeer, operation_id: operationId }, { operationId, peer }) },
++  searchMessages(peer, query, limit = 20) { return call('messages.search', { peer, query, limit }, { peer }) },
++  setTyping(peer, action = 0) { return call('messages.setTyping', { peer, action }, { peer, timeoutMs: 5000 }) },
++  markRead(peer, messageId) { return call('messages.markRead', { peer, max_id: messageId }, { peer, timeoutMs: 5000 }) },
+ 
+-  // ==== 资料 ====
+-  getPeer(peer) {
+-    return call('peers.get', { peer })
+-  },
+-  pinMessage(peer, messageId, unpin = false) {
+-    return call('peers.pinMessage', { peer, message_id: messageId, unpin })
+-  },
++  // Peers / auth / diagnostics
++  getPeer(peer) { return call('peers.get', { peer }, { peer }) },
++  pinMessage(peer, messageId, unpin = false, operationId) { return call('peers.pinMessage', { peer, message_id: messageId, unpin, operation_id: operationId }, { operationId, peer }) },
++  getAuthState() { return call('auth.getState') },
++  getBridgeStatus() { return call('bridge.getStatus') },
++  acknowledgePhoneProbe(nonce) { return call('bridge.probeAck', { nonce }) },
++  logout() { return call('auth.logout') }
++}
+ 
+-  // ==== 登录 ====
+-  getAuthState() {
+-    return call('auth.getState')
+-  },
+-  getBridgeStatus() {
+-    return call('bridge.getStatus')
+-  },
+-  acknowledgePhoneProbe(nonce) {
+-    return call('bridge.probeAck', { nonce })
+-  },
+-  logout() {
+-    return call('auth.logout')
+-  },
+-
+-  // 事件订阅
+-  on(event, handler) { return eventBus.on(event, handler) },
+-  // 触发事件（内部使用）
+-  _emit(event, data) { eventBus.emit(event, data) }
+-}
++export default api
+--- a/tgwear-quickapp-main/src/utils/interconn.js
++++ b/tgwear-quickapp-main/src/utils/interconn.js
+@@ -1,80 +1,155 @@
+ import interconnect from '@system.interconnect'
++import protocol from './protocol'
+ 
+-let conn = null
+-let readyState = 2 // 1=connected, 2=disconnected
+-const messageHandlers = new Set()
+-const stateHandlers = new Set()
++const root = typeof globalThis !== 'undefined' ? globalThis : global
++const KEY = '__tgWearInterconnectV2'
++if (!root[KEY]) {
++  root[KEY] = {
++    conn: null,
++    initialized: false,
++    facade: null,
++    readyState: 2,
++    messageHandlers: [],
++    stateHandlers: [],
++    physicalHandlers: [],
++    lastSystemState: null,
++    helloRequestTimer: null
++  }
++}
++const core = root[KEY]
++
++function notify(list, args) {
++  list.slice().forEach(fn => {
++    try { fn.apply(null, args) } catch (e) { console.warn('[interconn] observer failed') }
++  })
++}
++
++function dispatchPayload(text) {
++  let payload
++  try { payload = JSON.parse(text) } catch (e) {
++    console.warn('[interconn] assembled TGW payload is not JSON')
++    return
++  }
++  notify(core.messageHandlers, [payload])
++}
++
++function rawSend(frame) {
++  if (!core.conn) return Promise.reject({ code: -1, msg: 'interconnect not initialized' })
++  return new Promise((resolve, reject) => {
++    core.conn.send({
++      data: frame,
++      success: resolve,
++      fail: (err, code) => reject({ code, msg: (err && (err.data || err.msg)) || String(err || 'send failed') })
++    })
++  })
++}
+ 
+ function init() {
+-  if (conn) return conn
+-  conn = interconnect.instance()
+-
+-  conn.onopen = (data) => {
+-    readyState = 1
+-    stateHandlers.forEach(h => h(1, data && data.isReconnected))
++  if (core.facade) return core.facade.bridgeInit()
++  if (core.initialized) return core.conn
++  core.conn = interconnect.instance()
++  core.initialized = true
++  protocol.bind(rawSend, dispatchPayload, (state, info) => {
++    if (state === 'ready') core.readyState = 1
++    if (state === 'transport-down' || state === 'error') core.readyState = 2
++    notify(core.stateHandlers, [core.readyState, { protocolState: state, info, protocol: protocol.snapshot() }])
++  })
++  core.conn.onopen = data => {
++    core.readyState = 2 // Xiaomi link is up; TGW/2 hello is still required.
++    protocol.onPhysicalState(true, data)
++    notify(core.physicalHandlers, [true, data])
++    if (core.helloRequestTimer) clearTimeout(core.helloRequestTimer)
++    // Android is session authority. Request a phone hello only if it did not arrive promptly.
++    core.helloRequestTimer = setTimeout(() => {
++      if (!protocol.snapshot().ready) rawSend({ __tgw: 2, kind: 'helloRequest', client: 'vela' }).catch(() => {})
++    }, 1200)
+   }
+-  conn.onclose = (data) => {
+-    readyState = 2
+-    stateHandlers.forEach(h => h(2, data))
++  core.conn.onclose = data => {
++    if (core.helloRequestTimer) clearTimeout(core.helloRequestTimer)
++    core.helloRequestTimer = null
++    protocol.onPhysicalState(false, data)
++    core.readyState = 2
++    notify(core.physicalHandlers, [false, data])
++    notify(core.stateHandlers, [2, data])
+   }
+-  conn.onerror = (data) => {
+-    readyState = 2
+-    stateHandlers.forEach(h => h(2, data))
++  core.conn.onerror = data => {
++    protocol.onPhysicalState(false, data)
++    core.readyState = 2
++    notify(core.physicalHandlers, [false, data])
++    notify(core.stateHandlers, [2, data])
+   }
+-  conn.onmessage = (data) => {
+-    let payload
+-    try {
+-      payload = (typeof data.data === 'string') ? JSON.parse(data.data) : data.data
+-    } catch (e) {
+-      console.warn('[interconn] parse message failed:', e, data && data.data)
+-      return
+-    }
+-    // 单个 handler 抛错不影响其他 handler
+-    messageHandlers.forEach(h => {
+-      try { h(payload) } catch (e) {
+-        console.error('[interconn] message handler error:', e)
+-      }
+-    })
++  core.conn.onmessage = event => {
++    const raw = event && event.data
++    if (protocol.receive(raw)) return
++    // Unknown/unframed messages are deliberately not forwarded to business code.
++    console.warn('[interconn] ignored message outside TGW/2 framing')
+   }
+-  return conn
++  return core.conn
+ }
+ 
+-export default {
++function attachApp(facade) {
++  if (!facade || typeof facade.bridgeInit !== 'function') return false
++  core.facade = facade
++  core.facade.bridgeInit()
++  return true
++}
++
++const api = {
+   init,
++  attachApp,
+   send(data) {
+-    if (!conn || readyState !== 1) {
+-      return Promise.reject({ code: 1006, msg: 'not connected' })
+-    }
+-    return new Promise((resolve, reject) => {
+-      conn.send({
+-        data: { __rpc: true, ...data },
+-        success: resolve,
+-        fail: (err, code) => reject({ code, msg: err })
+-      })
+-    })
++    if (core.facade) return core.facade.bridgeSend(data)
++    return protocol.send(data)
+   },
+   onMessage(handler) {
+-    messageHandlers.add(handler)
+-    return () => messageHandlers.delete(handler)
++    if (core.facade) return core.facade.bridgeOnMessage(handler)
++    if (typeof handler !== 'function') return () => {}
++    if (core.messageHandlers.indexOf(handler) < 0) core.messageHandlers.push(handler)
++    return () => { core.messageHandlers = core.messageHandlers.filter(fn => fn !== handler) }
+   },
+   onState(handler) {
+-    stateHandlers.add(handler)
+-    return () => stateHandlers.delete(handler)
++    if (core.facade) return core.facade.bridgeOnState(handler)
++    if (typeof handler !== 'function') return () => {}
++    if (core.stateHandlers.indexOf(handler) < 0) core.stateHandlers.push(handler)
++    return () => { core.stateHandlers = core.stateHandlers.filter(fn => fn !== handler) }
+   },
+-  getReadyState() { return readyState },
++  onPhysicalState(handler) {
++    if (core.facade) return core.facade.bridgeOnPhysicalState(handler)
++    if (typeof handler !== 'function') return () => {}
++    if (core.physicalHandlers.indexOf(handler) < 0) core.physicalHandlers.push(handler)
++    return () => { core.physicalHandlers = core.physicalHandlers.filter(fn => fn !== handler) }
++  },
++  getReadyState() {
++    if (core.facade) return core.facade.bridgeGetReadyState()
++    return protocol.snapshot().ready ? 1 : 2
++  },
+   queryReadyState() {
+-    if (!conn) return Promise.reject({ code: 1006, msg: 'conn not init' })
++    if (core.facade) return core.facade.bridgeQueryReadyState()
++    const active = init()
+     return new Promise((resolve, reject) => {
+-      conn.getReadyState({
+-        success: resolve,
++      active.getReadyState({
++        success: state => {
++          core.lastSystemState = state
++          if (!state || state.status !== 1) protocol.onPhysicalState(false, { source: 'getReadyState', state })
++          resolve(state)
++        },
+         fail: (data, code) => reject({ code: code || (data && data.code), msg: (data && (data.data || data.msg)) || 'getReadyState failed' })
+       })
+     })
+   },
+   diagnose(timeout = 10000) {
+-    return new Promise((resolve, reject) => {
+-      if (!conn) return reject({ code: 1006, msg: 'conn not init' })
+-      conn.diagnosis({ timeout, success: resolve, fail: reject })
+-    })
++    if (core.facade) return core.facade.bridgeDiagnose(timeout)
++    const active = init()
++    return new Promise((resolve, reject) => active.diagnosis({ timeout, success: resolve, fail: reject }))
++  },
++  protocolSnapshot() {
++    if (core.facade) return core.facade.bridgeProtocolSnapshot()
++    return protocol.snapshot()
++  },
++  resetForTests() {
++    protocol.reset()
++    core.readyState = 2
+   }
+ }
++
++export default api
+--- a/tgwear-quickapp-main/src/utils/store.js
++++ b/tgwear-quickapp-main/src/utils/store.js
+@@ -1,113 +1,199 @@
+-/**
+- * 轻量内存状态 + 可选持久化。
+- *
+- * 性能约束（手环端）：
+- *   - 消息对象只保存短字符串（text / emoji 占位符），不保存图片、文件或二进制。
+- *   - 每个会话最多保留 MAX_MESSAGES 条，超出丢弃最旧的。
+- *   - 不创建深层拷贝，不做 JSON 深比较。
++/*
++ * One bounded app-owned in-memory store shared by all Vela page bundles.
++ * Private message bodies are intentionally not written to persistent storage.
+  */
+-const MAX_MESSAGES = 200
++const root = typeof globalThis !== 'undefined' ? globalThis : global
++const ROOT_KEY = '__tgWearStoreV2'
++const MAX_MESSAGES_PER_PEER = 80
++const MAX_CACHED_PEERS = 8
++const MAX_DIALOGS = 100
+ 
+-const state = {
+-  session: null,        // {user_id, name, phone}
+-  dialogs: [],          // 会话列表
+-  messages: {},         // peer -> [messages]
+-  connectionState: 2,   // 1=connected, 2=disconnected
+-  settings: {
+-    fontScale: 1.0,
+-    vibration: true,
+-    keepScreenOn: false
++function makeState() {
++  return {
++    session: null,
++    dialogs: [],
++    dialogsDirty: true,
++    messages: Object.create(null),
++    connectionState: 2,
++    settings: { fontScale: 1.0, vibration: true, keepScreenOn: false },
++    connectionStatus: null,
++    _settingsLoaded: false
++  }
++}
++if (!root[ROOT_KEY]) root[ROOT_KEY] = makeState()
++const state = root[ROOT_KEY]
++let appFacade = null
++
++function messageId(message) {
++  return message && (message.id !== undefined && message.id !== null ? String(message.id) : '')
++}
++
++function normalizeMessage(message) {
++  if (!message || typeof message !== 'object') return null
++  const text = typeof message.text === 'string' ? message.text : ''
++  return {
++    id: message.id,
++    out: !!message.out,
++    sender: typeof message.sender === 'string' ? message.sender.slice(0, 64) : '',
++    text: text.slice(0, 2000),
++    date: Number(message.date) || 0,
++    media: message.media ? { type: String(message.media.type || '').slice(0, 24), title: String(message.media.title || '').slice(0, 80) } : undefined,
++    sending: !!message.sending,
++    failed: !!message.failed,
++    operation_id: typeof message.operation_id === 'string' ? message.operation_id.slice(0, 96) : undefined,
++    reply_to: message.reply_to && typeof message.reply_to === 'object' ? { id: message.reply_to.id } : undefined
+   }
+ }
+ 
+-function trim(list) {
+-  if (list.length <= MAX_MESSAGES) return list
+-  return list.slice(list.length - MAX_MESSAGES)
++function trimMessages(list) {
++  if (list.length <= MAX_MESSAGES_PER_PEER) return list
++  return list.slice(list.length - MAX_MESSAGES_PER_PEER)
+ }
+ 
+-export default {
+-  get(key) { return state[key] },
+-  set(key, value) { state[key] = value },
++function touchPeer(peer) {
++  const keys = Object.keys(state.messages)
++  if (keys.indexOf(peer) >= 0) return
++  while (Object.keys(state.messages).length >= MAX_CACHED_PEERS) {
++    const oldest = Object.keys(state.messages)[0]
++    delete state.messages[oldest]
++  }
++}
+ 
+-  getDialog(peer) { return state.messages[peer] || [] },
++const store = {
++  attachApp(facade) {
++    if (!facade || typeof facade.bridgeStoreGet !== 'function') return false
++    appFacade = facade
++    return true
++  },
++  get(key) { return appFacade ? appFacade.bridgeStoreGet(key) : state[key] },
++  set(key, value) { return appFacade ? appFacade.bridgeStoreSet(key, value) : (state[key] = value) },
++
++  getDialog(peer) {
++    if (appFacade) return appFacade.bridgeStoreGetDialog(peer)
++    const list = state.messages[peer]
++    return list || []
++  },
+ 
+   appendDialog(peer, messages, prepend = false) {
+-    const list = state.messages[peer] || []
+-    state.messages[peer] = trim(prepend ? [...messages, ...list] : [...list, ...messages])
++    if (appFacade) return appFacade.bridgeStoreAppendDialog(peer, messages, prepend)
++    if (!peer || !Array.isArray(messages)) return []
++    touchPeer(peer)
++    const current = state.messages[peer] || []
++    const incoming = messages.map(normalizeMessage).filter(Boolean)
++    const merged = prepend ? incoming.concat(current) : current.concat(incoming)
++    const seen = Object.create(null)
++    const unique = []
++    merged.forEach(message => {
++      const id = messageId(message)
++      if (id && seen[id]) return
++      if (id) seen[id] = true
++      unique.push(message)
++    })
++    unique.sort((a, b) => (Number(a.date) - Number(b.date)) || (Number(a.id) - Number(b.id)))
++    state.messages[peer] = trimMessages(unique)
++    return state.messages[peer]
+   },
+ 
+-  /** 按 id upsert：新消息追加，已存在的（例如被编辑）就地替换。 */
+   upsertMessage(peer, message) {
++    if (appFacade) return appFacade.bridgeStoreUpsertMessage(peer, message)
+     if (!peer || !message) return
++    touchPeer(peer)
++    const normalized = normalizeMessage(message)
++    if (!normalized) return
+     const list = state.messages[peer] || []
+-    const id = message.id
+-    if (id === undefined || id === null) {
+-      state.messages[peer] = trim([...list, message])
+-      return
++    const key = messageId(normalized)
++    const idx = key ? list.findIndex(item => messageId(item) === key) : -1
++    if (idx >= 0) list[idx] = normalized
++    else list.push(normalized)
++    list.sort((a, b) => (Number(a.date) - Number(b.date)) || (Number(a.id) - Number(b.id)))
++    state.messages[peer] = trimMessages(list)
++  },
++
++  replaceMessageId(peer, localId, message, operationId) {
++    if (appFacade) return appFacade.bridgeStoreReplaceMessageId(peer, localId, message, operationId)
++    if (!peer) return false
++    const list = state.messages[peer] || []
++    const idx = list.findIndex(item => String(item.id) === String(localId)
++      || (!!operationId && item.operation_id === operationId))
++    if (idx < 0) {
++      if (message) this.upsertMessage(peer, message)
++      return false
+     }
+-    const idx = list.findIndex(m => m.id === id)
+-    if (idx >= 0) {
+-      list[idx] = message
+-      state.messages[peer] = list
+-    } else {
+-      state.messages[peer] = trim([...list, message])
++    const current = list[idx]
++    list[idx] = normalizeMessage(message || Object.assign({}, current, { id: localId, sending: false, failed: false }))
++    list.sort((a, b) => (Number(a.date) - Number(b.date)) || (Number(a.id) - Number(b.id)))
++    return true
++  },
++
++  removeMessages(peer, ids) {
++    if (appFacade) return appFacade.bridgeStoreRemoveMessages(peer, ids)
++    const targets = Array.isArray(ids) ? ids.map(String) : []
++    if (!targets.length) return
++    const peers = peer ? [peer] : Object.keys(state.messages)
++    peers.forEach(key => {
++      state.messages[key] = (state.messages[key] || []).filter(item => targets.indexOf(String(item.id)) < 0)
++    })
++  },
++
++  upsertDialog(dialog) {
++    if (appFacade) return appFacade.bridgeStoreUpsertDialog(dialog)
++    if (!dialog || !dialog.peer) return
++    const list = state.dialogs
++    const idx = list.findIndex(item => item.peer === dialog.peer)
++    const normalized = Object.assign({}, dialog, {
++      title: String(dialog.title || '未知').slice(0, 80),
++      last_message: normalizeMessage(dialog.last_message)
++    })
++    if (idx >= 0) list[idx] = normalized
++    else list.unshift(normalized)
++    list.sort((a, b) => (Number(b.last_message_date) - Number(a.last_message_date)) || (Number(b.last_message_id) - Number(a.last_message_id)))
++    if (list.length > MAX_DIALOGS) list.length = MAX_DIALOGS
++  },
++
++  clearDialogs() { if (appFacade) return appFacade.bridgeStoreClearDialogs(); state.dialogs = [] },
++  clearSession() { if (appFacade) return appFacade.bridgeStoreClearSession(); state.session = null },
++
++  loadSettings() {
++    if (appFacade) return Promise.resolve(appFacade.bridgeStoreLoadSettings())
++    if (state._settingsLoaded) return Promise.resolve(state.settings)
++    state._settingsLoaded = true
++    try {
++      const storage = require('@system.storage')
++      return new Promise(resolve => {
++        storage.get({
++          key: 'settings',
++          success: result => {
++            try { Object.assign(state.settings, JSON.parse((result && result.value) || result || '{}')) } catch (e) {}
++            resolve(state.settings)
++          },
++          fail: () => resolve(state.settings)
++        })
++      })
++    } catch (e) {
++      return Promise.resolve(state.settings)
+     }
+   },
+ 
+-  /** 出站消息确认：local_id -> server id（或直接替换整条消息）。 */
+-  replaceMessageId(peer, localId, message) {
+-    if (!peer) return
+-    const list = state.messages[peer] || []
+-    const idx = list.findIndex(m => m.id === localId)
+-    if (idx < 0) return
+-    if (message) {
+-      list[idx] = message
+-    } else {
+-      list[idx] = { ...list[idx], id: localId }
+-    }
+-    state.messages[peer] = list
++  saveSettings() {
++    if (appFacade) return appFacade.bridgeStoreSaveSettings()
++    try {
++      const storage = require('@system.storage')
++      storage.set({ key: 'settings', value: JSON.stringify(state.settings) })
++    } catch (e) { console.warn('[store] settings persistence unavailable') }
+   },
+ 
+-  /** 删除指定 id 的消息。 */
+-  removeMessages(peer, ids) {
+-    if (!peer || !ids || !ids.length) return
+-    const idSet = new Set(ids)
+-    const list = state.messages[peer] || []
+-    state.messages[peer] = list.filter(m => !idSet.has(m.id))
++  snapshot() {
++    if (appFacade) return appFacade.bridgeStoreSnapshot()
++    let messageCount = 0
++    Object.keys(state.messages).forEach(peer => { messageCount += state.messages[peer].length })
++    return { dialogs: state.dialogs.length, peers: Object.keys(state.messages).length, messages: messageCount, maxDialogs: MAX_DIALOGS, maxPerPeer: MAX_MESSAGES_PER_PEER }
+   },
+ 
+-  upsertDialog(dialog) {
+-    if (!dialog || !dialog.peer) return
+-    const idx = state.dialogs.findIndex(d => d.peer === dialog.peer)
+-    if (idx >= 0) state.dialogs[idx] = dialog
+-    else state.dialogs.unshift(dialog)
+-  },
+-
+-  clearDialogs() {
+-    state.dialogs = []
+-    state.messages = {}
+-  },
+-
+-  loadSettings() {
+-    const storage = require('@system.storage')
+-    return new Promise(resolve => {
+-      storage.get({
+-        key: 'settings',
+-        success: (d) => {
+-          try { Object.assign(state.settings, JSON.parse(d || '{}')) } catch (e) {}
+-          resolve(state.settings)
+-        },
+-        fail: () => resolve(state.settings)
+-      })
+-    })
+-  },
+-
+-  saveSettings() {
+-    const storage = require('@system.storage')
+-    storage.set({ key: 'settings', value: JSON.stringify(state.settings) })
+-  },
+-
+-  clearSession() {
+-    state.session = null
++  resetForTests() {
++    const fresh = makeState()
++    Object.keys(state).forEach(key => { delete state[key] })
++    Object.assign(state, fresh)
+   }
+ }
++
++export default store
+--- /dev/null
++++ b/Nagram-tgwear/TMessagesProj/src/main/java/org/telegram/tgwear/ReliableWearConnection.java
+@@ -0,0 +1,509 @@
++package org.telegram.tgwear;
++
++import android.util.Base64;
++import android.util.Log;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.nio.charset.StandardCharsets;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.zip.CRC32;
++
++/**
++ * TG Wear v2 application framing over the existing Xiaomi MessageApi transport.
++ * This class intentionally has no SimpleFetch/SF_* protocol dependency.
++ */
++public final class ReliableWearConnection implements WearConnection {
++    private static final String TAG = "TGWear/Protocol";
++    private static final int VERSION = 2;
++    private static final int CHUNK_BYTES = 2048;
++    private static final int MAX_LOGICAL_BYTES = 128 * 1024;
++    private static final int MAX_CHUNKS = 64;
++    private static final int MAX_WIRE_FRAME_CHARS = 8192;
++    private static final long ACK_TIMEOUT_MS = 3000L;
++    private static final int MAX_RETRIES = 3;
++    private static final long ASSEMBLY_TTL_MS = 30_000L;
++
++    private final WearConnection transport;
++    private final ExecutorService sendQueue = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
++            new ArrayBlockingQueue<>(8), r -> daemonThread(r, "TGWear-send-queue"), new ThreadPoolExecutor.AbortPolicy());
++    private final ExecutorService wireQueue = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
++            new ArrayBlockingQueue<>(256), r -> daemonThread(r, "TGWear-wire-queue"), new ThreadPoolExecutor.AbortPolicy());
++    private final AtomicLong transferSequence = new AtomicLong();
++    private final Object lock = new Object();
++    private final Map<String, AckWaiter> ackWaiters = new HashMap<>();
++    private final Map<String, Assembly> assemblies = new HashMap<>();
++    private final Map<String, CompletedTransfer> completedTransfers = new HashMap<>();
++    private volatile Listener listener;
++    private volatile boolean physicalReady;
++    private volatile boolean protocolReady;
++    private volatile boolean destroyed;
++    private volatile String session = "";
++    private volatile int negotiatedChunkBytes = CHUNK_BYTES;
++    @Nullable private volatile JSONObject lastHelloFrame;
++    private volatile String lastError = "";
++
++    public ReliableWearConnection(@NonNull WearConnection transport) {
++        this.transport = transport;
++        transport.setMessageListener(new Listener() {
++            @Override public void onReadyStateChanged(boolean ready, @Nullable Object info) {
++                onPhysicalState(ready, info);
++            }
++            @Override public void onMessage(@NonNull String message) {
++                onTransportMessage(message);
++            }
++        });
++    }
++
++    @Override public void init() {
++        destroyed = false;
++        transport.init();
++    }
++
++    @Override public void reconnect() {
++        if (destroyed) destroyed = false;
++        transport.reconnect();
++    }
++
++    @Override public boolean send(@NonNull String data) {
++        if (!protocolReady || destroyed) {
++            Log.w(TAG, "logical send rejected: TGW/2 session not ready");
++            return false;
++        }
++        final String captured = data;
++        try {
++            sendQueue.execute(() -> sendLogical(captured));
++            return true; // accepted into bounded logical queue; remote ACK remains authoritative
++        } catch (RuntimeException error) {
++            lastError = safeMessage(error);
++            Log.e(TAG, "send queue rejected payload", error);
++            return false;
++        }
++    }
++
++    @Override public void setMessageListener(@Nullable Listener listener) {
++        this.listener = listener;
++    }
++
++    @Override public boolean isReady() {
++        return physicalReady && protocolReady && !destroyed;
++    }
++
++    public String getLastError() { return lastError; }
++
++    private void onPhysicalState(boolean ready, @Nullable Object info) {
++        physicalReady = ready;
++        protocolReady = false;
++        WearDiagnosticStatus.protocolState(false, ready ? "Xiaomi transport up; negotiating TGW/2" : "Xiaomi transport down");
++        session = "";
++        negotiatedChunkBytes = CHUNK_BYTES;
++        failWaiters(new IllegalStateException(ready ? "TGW session renegotiating" : "wearable transport disconnected"));
++        synchronized (lock) { assemblies.clear(); completedTransfers.clear(); }
++        Listener target = listener;
++        if (!ready && target != null) target.onReadyStateChanged(false, info);
++        if (ready && !destroyed) {
++            sendQueue.execute(this::negotiateSession);
++        }
++    }
++
++    private void negotiateSession() {
++        if (destroyed || !physicalReady) return;
++        final String candidate = "p-" + UUID.randomUUID().toString();
++        final CountDownLatch latch = new CountDownLatch(1);
++        synchronized (lock) {
++            session = candidate;
++            helloWaiter = latch;
++        }
++        JSONObject hello = new JSONObject();
++        try {
++            hello.put("__tgw", VERSION);
++            hello.put("kind", "hello");
++            hello.put("session", candidate);
++            hello.put("maxChunk", CHUNK_BYTES);
++        } catch (JSONException impossible) { return; }
++        lastHelloFrame = hello;
++
++        for (int attempt = 0; attempt <= MAX_RETRIES && !protocolReady && physicalReady && !destroyed; attempt++) {
++            sendWire(hello);
++            try {
++                if (latch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) break;
++            } catch (InterruptedException interrupted) {
++                Thread.currentThread().interrupt();
++                return;
++            }
++            if (attempt < MAX_RETRIES) sleep(1000L << attempt);
++        }
++        synchronized (lock) { if (helloWaiter == latch) helloWaiter = null; }
++        if (!protocolReady && physicalReady && !destroyed) {
++            lastError = "TGW/2 handshake timeout";
++            Log.w(TAG, lastError);
++            WearDiagnosticStatus.protocolState(false, lastError);
++            Listener target = listener;
++            if (target != null) target.onReadyStateChanged(false, lastError);
++        }
++    }
++
++    @Nullable private CountDownLatch helloWaiter;
++
++    private void onTransportMessage(@NonNull String raw) {
++        if (destroyed || raw.length() > MAX_WIRE_FRAME_CHARS) return;
++        final JSONObject frame;
++        try { frame = new JSONObject(raw); }
++        catch (JSONException notProtocolFrame) {
++            Log.w(TAG, "dropping non-JSON message at transport boundary");
++            return;
++        }
++        if (frame.optInt("__tgw", -1) != VERSION) {
++            Log.w(TAG, "dropping unframed/unknown-version message");
++            return;
++        }
++        WearDiagnosticStatus.protocolFrame(true);
++        String kind = frame.optString("kind", "");
++        if ("helloAck".equals(kind)) {
++            CountDownLatch latch;
++            synchronized (lock) {
++                if (!session.equals(frame.optString("session", ""))) return;
++                negotiatedChunkBytes = Math.max(128, Math.min(CHUNK_BYTES, frame.optInt("maxChunk", CHUNK_BYTES)));
++                protocolReady = true;
++                latch = helloWaiter;
++            }
++            WearDiagnosticStatus.protocolChunkBytes(negotiatedChunkBytes);
++            WearDiagnosticStatus.protocolState(true, "TGW/2 session ready");
++            if (latch != null) latch.countDown();
++            Log.i(TAG, "TGW/2 session ready chunkBytes=" + Math.min(CHUNK_BYTES, frame.optInt("maxChunk", CHUNK_BYTES)));
++            Listener target = listener;
++            if (target != null) target.onReadyStateChanged(true, "tgw2-session-ready");
++            return;
++        }
++        if ("helloRequest".equals(kind)) {
++            JSONObject hello = lastHelloFrame;
++            if (hello != null && physicalReady) sendWire(hello);
++            return;
++        }
++        if (!protocolReady || !session.equals(frame.optString("session", ""))) return;
++        if ("ack".equals(kind) || "nack".equals(kind)) {
++            completeWaiter(frame, "ack".equals(kind));
++        } else if ("commitAck".equals(kind)) {
++            completeWaiter(frame, true);
++        } else if ("frame".equals(kind)) {
++            receiveDataFrame(frame);
++        } else {
++            Log.w(TAG, "unknown TGW/2 frame kind=" + kind);
++        }
++    }
++
++    private void completeWaiter(JSONObject frame, boolean ok) {
++        String key = frame.optString("transferId", "") + ":" + frame.optInt("seq", -2);
++        if ("commitAck".equals(frame.optString("kind"))) key += ":commit";
++        AckWaiter waiter;
++        synchronized (lock) { waiter = ackWaiters.remove(key); }
++        if (waiter == null) return;
++        waiter.ok = ok;
++        waiter.reason = frame.optString("reason", "peer rejected frame");
++        waiter.latch.countDown();
++    }
++
++    private void receiveDataFrame(JSONObject frame) {
++        String transferId = frame.optString("transferId", "");
++        int seq = frame.optInt("seq", -1);
++        int total = frame.optInt("total", -1);
++        int totalBytes = frame.optInt("totalBytes", -1);
++        int byteLength = frame.optInt("byteLength", -1);
++        String totalCrc = frame.optString("totalCrc32", "");
++        String data = frame.optString("data", "");
++        if (transferId.isEmpty() || transferId.length() > 80 || total < 1 || total > MAX_CHUNKS || seq < 0 || seq >= total || totalBytes < 0 || totalBytes > MAX_LOGICAL_BYTES || byteLength < 0 || byteLength > negotiatedChunkBytes || !totalCrc.matches("[0-9a-fA-F]{8}")) {
++            sendControl("nack", transferId, seq, 0, "invalid frame metadata");
++            return;
++        }
++        final byte[] chunk;
++        try { chunk = Base64.decode(data, Base64.DEFAULT); }
++        catch (IllegalArgumentException badBase64) { sendControl("nack", transferId, seq, 0, "invalid base64"); return; }
++        if (chunk.length != byteLength || !crc32(chunk).equalsIgnoreCase(frame.optString("chunkCrc32", ""))) {
++            sendControl("nack", transferId, seq, 0, "chunk checksum/length invalid");
++            return;
++        }
++        CompletedTransfer completed;
++        synchronized (lock) {
++            pruneCompletedTransfers();
++            completed = completedTransfers.get(transferId);
++        }
++        if (completed != null) {
++            if (completed.totalCrc32.equalsIgnoreCase(totalCrc) && seq == total - 1) {
++                sendControl("ack", transferId, seq, total, null);
++                sendCommitAck(transferId, seq, total, totalCrc);
++            } else {
++                sendControl("nack", transferId, seq, 0, "transfer already committed");
++            }
++            return;
++        }
++        Assembly assembly;
++        synchronized (lock) {
++            pruneAssemblies();
++            assembly = assemblies.get(transferId);
++            if (assembly == null) {
++                if (assemblies.size() >= 1) { sendControl("nack", transferId, seq, 0, "receiver busy"); return; }
++                assembly = new Assembly(total, totalBytes, totalCrc, System.currentTimeMillis() + ASSEMBLY_TTL_MS);
++                assemblies.put(transferId, assembly);
++            }
++            if (assembly.total != total || assembly.totalBytes != totalBytes || !assembly.totalCrc32.equals(totalCrc) || assembly.expiresAt < System.currentTimeMillis()) {
++                assemblies.remove(transferId);
++                sendControl("nack", transferId, seq, 0, "transfer metadata mismatch");
++                return;
++            }
++            if (assembly.chunks[seq] == null) {
++                if (seq != assembly.nextSeq) { sendControl("nack", transferId, seq, assembly.nextSeq, "out of order"); return; }
++                assembly.chunks[seq] = chunk;
++                assembly.receivedBytes += chunk.length;
++                assembly.received++;
++                assembly.nextSeq++;
++            }
++        }
++        sendControl("ack", transferId, seq, assembly.nextSeq, null);
++        if (assembly.received != assembly.total) return;
++        if (assembly.receivedBytes != assembly.totalBytes) {
++            synchronized (lock) { assemblies.remove(transferId); }
++            sendControl("nack", transferId, seq, 0, "total length mismatch");
++            return;
++        }
++        byte[] all = new byte[assembly.receivedBytes];
++        int offset = 0;
++        for (byte[] part : assembly.chunks) {
++            if (part == null || offset + part.length > all.length) {
++                synchronized (lock) { assemblies.remove(transferId); }
++                sendControl("nack", transferId, seq, 0, "missing chunk");
++                return;
++            }
++            System.arraycopy(part, 0, all, offset, part.length);
++            offset += part.length;
++        }
++        if (!crc32(all).equalsIgnoreCase(assembly.totalCrc32)) {
++            synchronized (lock) { assemblies.remove(transferId); }
++            sendControl("nack", transferId, seq, 0, "total checksum mismatch");
++            return;
++        }
++        final String payload = new String(all, StandardCharsets.UTF_8);
++        synchronized (lock) {
++            assemblies.remove(transferId);
++            if (completedTransfers.size() >= 128) {
++                String oldest = completedTransfers.keySet().iterator().next();
++                completedTransfers.remove(oldest);
++            }
++            completedTransfers.put(transferId, new CompletedTransfer(assembly.totalCrc32, System.currentTimeMillis() + ASSEMBLY_TTL_MS));
++        }
++        sendCommitAck(transferId, seq, assembly.total, assembly.totalCrc32);
++        WearDiagnosticStatus.protocolPayloadReceived();
++        Listener target = listener;
++        if (target != null) target.onMessage(payload);
++    }
++
++    private void sendLogical(String payload) {
++        if (destroyed || !protocolReady || !physicalReady) {
++            Log.w(TAG, "queued logical payload dropped because TGW/2 session is unavailable");
++            return;
++        }
++        byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
++        if (bytes.length > MAX_LOGICAL_BYTES) {
++            lastError = "logical payload exceeds 128 KiB";
++            Log.w(TAG, lastError + " bytes=" + bytes.length);
++            return;
++        }
++        final String transferId = "p-" + Long.toString(transferSequence.incrementAndGet(), 36) + "-" + UUID.randomUUID().toString().substring(0, 8);
++        int chunkBytes = negotiatedChunkBytes;
++        int total = Math.max(1, (bytes.length + chunkBytes - 1) / chunkBytes);
++        if (total > MAX_CHUNKS) {
++            lastError = "logical payload exceeds 64 chunks";
++            return;
++        }
++        String totalCrc = crc32(bytes);
++        for (int seq = 0; seq < total; seq++) {
++            int start = seq * chunkBytes;
++            int end = Math.min(bytes.length, start + chunkBytes);
++            byte[] part = new byte[end - start];
++            System.arraycopy(bytes, start, part, 0, part.length);
++            JSONObject frame = new JSONObject();
++            try {
++                frame.put("__tgw", VERSION);
++                frame.put("kind", "frame");
++                frame.put("session", session);
++                frame.put("transferId", transferId);
++                frame.put("seq", seq);
++                frame.put("total", total);
++                frame.put("byteLength", part.length);
++                frame.put("totalBytes", bytes.length);
++                frame.put("totalCrc32", totalCrc);
++                frame.put("chunkCrc32", crc32(part));
++                frame.put("data", Base64.encodeToString(part, Base64.NO_WRAP));
++            } catch (JSONException impossible) { return; }
++            if (!sendAndAwait(frame, transferId, seq, seq == total - 1)) return;
++        }
++    }
++
++    private boolean sendAndAwait(JSONObject frame, String transferId, int seq, boolean commit) {
++        String key = transferId + ":" + seq + (commit ? ":commit" : "");
++        for (int attempt = 0; attempt <= MAX_RETRIES && !destroyed && protocolReady; attempt++) {
++            AckWaiter waiter = new AckWaiter();
++            synchronized (lock) { ackWaiters.put(key, waiter); }
++            if (!sendWire(frame)) {
++                synchronized (lock) { ackWaiters.remove(key); }
++                return false;
++            }
++            try {
++                if (waiter.latch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS) && waiter.ok) return true;
++                lastError = waiter.reason;
++            } catch (InterruptedException interrupted) {
++                Thread.currentThread().interrupt();
++                synchronized (lock) { ackWaiters.remove(key); }
++                return false;
++            }
++            synchronized (lock) { ackWaiters.remove(key); }
++            if (attempt < MAX_RETRIES) sleep(1000L << attempt);
++        }
++        lastError = "TGW/2 ACK retries exhausted transfer=" + transferId + " seq=" + seq;
++        Log.e(TAG, lastError);
++        return false;
++    }
++
++    private void sendControl(String kind, String transferId, int seq, int nextSeq, @Nullable String reason) {
++        JSONObject frame = control(kind, transferId, seq, nextSeq, reason);
++        if (frame != null && physicalReady) sendWire(frame);
++    }
++
++    private void sendCommitAck(String transferId, int seq, int total, String totalCrc32) {
++        JSONObject frame = control("commitAck", transferId, seq, total, null);
++        if (frame == null) return;
++        try { frame.put("totalCrc32", totalCrc32); sendWire(frame); }
++        catch (JSONException ignored) { }
++    }
++
++    @Nullable private JSONObject control(String kind, String transferId, int seq, int nextSeq, @Nullable String reason) {
++        JSONObject frame = new JSONObject();
++        try {
++            frame.put("__tgw", VERSION);
++            frame.put("kind", kind);
++            frame.put("session", session);
++            frame.put("transferId", transferId);
++            frame.put("seq", seq);
++            frame.put("nextSeq", nextSeq);
++            if (reason != null) frame.put("reason", reason);
++            return frame;
++        } catch (JSONException impossible) { return null; }
++    }
++
++    private void failWaiters(Throwable error) {
++        synchronized (lock) {
++            for (AckWaiter waiter : ackWaiters.values()) {
++                waiter.ok = false;
++                waiter.reason = safeMessage(error);
++                waiter.latch.countDown();
++            }
++            ackWaiters.clear();
++            if (helloWaiter != null) helloWaiter.countDown();
++            helloWaiter = null;
++        }
++    }
++
++    private void pruneAssemblies() {
++        long now = System.currentTimeMillis();
++        assemblies.entrySet().removeIf(entry -> entry.getValue().expiresAt < now);
++    }
++
++    private void pruneCompletedTransfers() {
++        long now = System.currentTimeMillis();
++        completedTransfers.entrySet().removeIf(entry -> entry.getValue().expiresAt < now);
++    }
++
++    private boolean sendWire(@NonNull JSONObject frame) {
++        try {
++            wireQueue.execute(() -> {
++                if (!destroyed && physicalReady && !transport.send(frame.toString())) {
++                    lastError = "Xiaomi transport rejected frame";
++                    Log.w(TAG, lastError);
++                } else if (!destroyed && physicalReady) WearDiagnosticStatus.protocolFrame(false);
++            });
++            return true;
++        } catch (RuntimeException rejected) {
++            lastError = "TGW/2 wire queue full";
++            Log.e(TAG, lastError, rejected);
++            return false;
++        }
++    }
++
++    private static Thread daemonThread(Runnable runnable, String name) {
++        Thread thread = new Thread(runnable, name);
++        thread.setDaemon(true);
++        return thread;
++    }
++
++    private static String crc32(byte[] bytes) {
++        CRC32 crc = new CRC32();
++        crc.update(bytes);
++        return String.format(java.util.Locale.US, "%08x", crc.getValue());
++    }
++
++    private static void sleep(long millis) {
++        try { Thread.sleep(millis); }
++        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
++    }
++
++    private static String safeMessage(Throwable error) {
++        String message = error == null ? "unknown" : error.getMessage();
++        if (message == null) message = error.getClass().getSimpleName();
++        return message.length() > 160 ? message.substring(0, 160) : message;
++    }
++
++    @Override public void destroy() {
++        destroyed = true;
++        protocolReady = false;
++        physicalReady = false;
++        failWaiters(new IllegalStateException("connection destroyed"));
++        synchronized (lock) { assemblies.clear(); }
++        sendQueue.shutdownNow();
++        wireQueue.shutdownNow();
++        transport.destroy();
++    }
++
++    private static final class AckWaiter {
++        final CountDownLatch latch = new CountDownLatch(1);
++        volatile boolean ok;
++        volatile String reason = "ACK timeout";
++    }
++
++    private static final class Assembly {
++        final int total;
++        final int totalBytes;
++        final String totalCrc32;
++        final long expiresAt;
++        final byte[][] chunks;
++        int received;
++        int receivedBytes;
++        int nextSeq;
++        Assembly(int total, int totalBytes, String totalCrc32, long expiresAt) {
++            this.total = total;
++            this.totalBytes = totalBytes;
++            this.totalCrc32 = totalCrc32;
++            this.expiresAt = expiresAt;
++            this.chunks = new byte[total][];
++        }
++    }
++
++    private static final class CompletedTransfer {
++        final String totalCrc32;
++        final long expiresAt;
++        CompletedTransfer(String totalCrc32, long expiresAt) {
++            this.totalCrc32 = totalCrc32;
++            this.expiresAt = expiresAt;
++        }
++    }
++}
+--- /dev/null
++++ b/tgwear-quickapp-main/src/utils/protocol.js
+@@ -0,0 +1,408 @@
++/*
++ * TG Wear application-level framing. This is deliberately not SimpleFetch (SF_*)
++ * and runs over the existing Xiaomi system.interconnect object channel.
++ */
++const VERSION = 2
++const DEFAULT_CHUNK_BYTES = 2048
++const MAX_LOGICAL_BYTES = 128 * 1024
++const MAX_CHUNKS = 64
++const MAX_ASSEMBLERS = 1
++const ACK_TIMEOUT_MS = 3000
++const MAX_RETRIES = 3
++const ASSEMBLY_TTL_MS = 30000
++const COMPLETED_TTL_MS = 30000
++const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
++
++function utf8Encode(text) {
++  const out = []
++  for (let i = 0; i < text.length; i++) {
++    let cp = text.charCodeAt(i)
++    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < text.length) {
++      const low = text.charCodeAt(i + 1)
++      if (low >= 0xdc00 && low <= 0xdfff) {
++        cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00)
++        i++
++      }
++    }
++    if (cp < 0x80) out.push(cp)
++    else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 63))
++    else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
++    else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
++  }
++  return out
++}
++
++function utf8Decode(bytes) {
++  let out = ''
++  for (let i = 0; i < bytes.length;) {
++    const a = bytes[i++] & 255
++    let cp = a
++    if (a >= 0xc2 && a <= 0xdf && i < bytes.length) cp = ((a & 31) << 6) | (bytes[i++] & 63)
++    else if (a >= 0xe0 && a <= 0xef && i + 1 < bytes.length) cp = ((a & 15) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63)
++    else if (a >= 0xf0 && a <= 0xf4 && i + 2 < bytes.length) cp = ((a & 7) << 18) | ((bytes[i++] & 63) << 12) | ((bytes[i++] & 63) << 6) | (bytes[i++] & 63)
++    else if (a >= 0x80) cp = 0xfffd
++    if (cp <= 0xffff) out += String.fromCharCode(cp)
++    else {
++      cp -= 0x10000
++      out += String.fromCharCode(0xd800 | (cp >> 10), 0xdc00 | (cp & 1023))
++    }
++  }
++  return out
++}
++
++function base64Encode(bytes) {
++  let out = ''
++  for (let i = 0; i < bytes.length; i += 3) {
++    const a = bytes[i] & 255
++    const hasB = i + 1 < bytes.length
++    const hasC = i + 2 < bytes.length
++    const b = hasB ? bytes[i + 1] & 255 : 0
++    const c = hasC ? bytes[i + 2] & 255 : 0
++    out += BASE64[a >> 2]
++    out += BASE64[((a & 3) << 4) | (b >> 4)]
++    out += hasB ? BASE64[((b & 15) << 2) | (c >> 6)] : '='
++    out += hasC ? BASE64[c & 63] : '='
++  }
++  return out
++}
++
++function base64Decode(text) {
++  if (typeof text !== 'string' || text.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) throw new Error('bad base64')
++  const out = []
++  for (let i = 0; i < text.length; i += 4) {
++    const a = BASE64.indexOf(text[i])
++    const b = BASE64.indexOf(text[i + 1])
++    const c = text[i + 2] === '=' ? 0 : BASE64.indexOf(text[i + 2])
++    const d = text[i + 3] === '=' ? 0 : BASE64.indexOf(text[i + 3])
++    if (a < 0 || b < 0 || c < 0 || d < 0) throw new Error('bad base64')
++    out.push((a << 2) | (b >> 4))
++    if (text[i + 2] !== '=') out.push(((b & 15) << 4) | (c >> 2))
++    if (text[i + 3] !== '=') out.push(((c & 3) << 6) | d)
++  }
++  return out
++}
++
++function crc32(bytes) {
++  let crc = -1
++  for (let i = 0; i < bytes.length; i++) {
++    crc ^= bytes[i] & 255
++    for (let j = 0; j < 8; j++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0)
++  }
++  return ((crc ^ -1) >>> 0).toString(16).padStart(8, '0')
++}
++
++function makeTransfer(text, session, transferId, chunkBytes = DEFAULT_CHUNK_BYTES) {
++  const bytes = utf8Encode(text)
++  if (bytes.length > MAX_LOGICAL_BYTES) throw new Error('logical payload exceeds 128 KiB')
++  const size = Math.max(128, Math.min(DEFAULT_CHUNK_BYTES, chunkBytes | 0))
++  const total = Math.max(1, Math.ceil(bytes.length / size))
++  if (total > MAX_CHUNKS) throw new Error('logical payload exceeds 64 chunks')
++  const totalCrc32 = crc32(bytes)
++  const frames = []
++  for (let seq = 0; seq < total; seq++) {
++    const chunk = bytes.slice(seq * size, Math.min(bytes.length, (seq + 1) * size))
++    frames.push({
++      __tgw: VERSION, kind: 'frame', session, transferId, seq, total,
++      byteLength: chunk.length, totalBytes: bytes.length, totalCrc32,
++      chunkCrc32: crc32(chunk), data: base64Encode(chunk)
++    })
++  }
++  return frames
++}
++
++function isFrame(value) {
++  return !!value && typeof value === 'object' && value.__tgw === VERSION && typeof value.kind === 'string'
++}
++
++function createProtocol(targetRoot) {
++  const shared = targetRoot || (typeof globalThis !== 'undefined' ? globalThis : global)
++  const key = '__tgWearProtocolV2'
++  if (shared[key]) return shared[key]
++
++  const state = {
++    rawSend: null,
++    onPayload: null,
++    onState: null,
++    connected: false,
++    ready: false,
++    session: '',
++    localSession: '',
++    chunkBytes: DEFAULT_CHUNK_BYTES,
++    sequence: 0,
++    queueDepth: 0,
++    outgoing: Promise.resolve(),
++    ackWaiters: {},
++    commitWaiters: {},
++    commitSeen: {},
++    assemblies: {},
++    completed: {},
++    lastError: '',
++    retryCount: 0
++  }
++
++  function emitState(name, info) {
++    if (state.onState) {
++      try { state.onState(name, info || {}) } catch (e) { console.warn('[TGW2] state listener failed') }
++    }
++  }
++
++  function rawSend(frame) {
++    if (!state.rawSend) return Promise.reject(new Error('interconnect sender unavailable'))
++    return Promise.resolve().then(() => state.rawSend(frame))
++  }
++
++  function failWaiters(error) {
++    Object.keys(state.ackWaiters).forEach(k => { state.ackWaiters[k].reject(error); delete state.ackWaiters[k] })
++    Object.keys(state.commitWaiters).forEach(k => { state.commitWaiters[k].reject(error); delete state.commitWaiters[k] })
++  }
++
++  function rememberBounded(cache, keyName, value, cap) {
++    const now = Date.now()
++    Object.keys(cache).forEach(key => { if (cache[key].expires <= now) delete cache[key] })
++    while (Object.keys(cache).length >= cap && !Object.prototype.hasOwnProperty.call(cache, keyName)) {
++      delete cache[Object.keys(cache)[0]]
++    }
++    cache[keyName] = value
++  }
++
++  function physicalState(connected, info) {
++    const next = !!connected
++    if (state.connected === next && (!next || state.ready)) return
++    state.connected = next
++    state.ready = false
++    state.session = ''
++    state.assemblies = {}
++    state.completed = {}
++    state.commitSeen = {}
++    failWaiters(new Error(next ? 'session renegotiating' : 'interconnect disconnected'))
++    emitState(next ? 'transport-up' : 'transport-down', info)
++    if (next) {
++      state.localSession = ''
++    }
++  }
++
++  function settleAck(frame, positive) {
++    const keyName = frame.transferId + ':' + frame.seq
++    const waiter = state.ackWaiters[keyName]
++    if (!waiter || frame.session !== state.session) return
++    delete state.ackWaiters[keyName]
++    positive ? waiter.resolve(true) : waiter.reject(new Error(frame.reason || 'peer rejected chunk'))
++  }
++
++  function receiveFrame(frame) {
++    if (frame.session !== state.session) return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: 0, reason: 'session mismatch' }).catch(() => {})
++    if (typeof frame.transferId !== 'string' || frame.transferId.length > 80 || !Number.isInteger(frame.seq) || !Number.isInteger(frame.total) || frame.total < 1 || frame.total > MAX_CHUNKS || frame.seq < 0 || frame.seq >= frame.total || !Number.isInteger(frame.totalBytes) || frame.totalBytes < 0 || frame.totalBytes > MAX_LOGICAL_BYTES || !Number.isInteger(frame.byteLength) || frame.byteLength < 0 || frame.byteLength > state.chunkBytes || typeof frame.totalCrc32 !== 'string' || !/^[0-9a-fA-F]{8}$/.test(frame.totalCrc32) || typeof frame.data !== 'string' || frame.data.length > Math.ceil(state.chunkBytes / 3) * 4 + 4) return
++
++    const finished = state.completed[frame.transferId]
++    if (finished && finished.expires > Date.now()) {
++      rawSend({ __tgw: VERSION, kind: 'ack', session: state.session, transferId: frame.transferId, seq: frame.seq, nextSeq: frame.seq + 1 }).catch(() => {})
++      rawSend({ __tgw: VERSION, kind: 'commitAck', session: state.session, transferId: frame.transferId, seq: frame.seq, totalCrc32: finished.totalCrc32 }).catch(() => {})
++      return
++    }
++    let item = state.assemblies[frame.transferId]
++    if (!item) {
++      const keys = Object.keys(state.assemblies)
++      if (keys.length >= MAX_ASSEMBLERS) return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: 0, reason: 'receiver busy' }).catch(() => {})
++      item = state.assemblies[frame.transferId] = { total: frame.total, totalBytes: frame.totalBytes, totalCrc32: frame.totalCrc32, chunks: {}, received: 0, receivedBytes: 0, nextSeq: 0, expires: Date.now() + ASSEMBLY_TTL_MS }
++    }
++    if (item.total !== frame.total || item.totalBytes !== frame.totalBytes || item.totalCrc32 !== frame.totalCrc32 || item.expires < Date.now()) {
++      delete state.assemblies[frame.transferId]
++      return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: 0, reason: 'transfer metadata mismatch' }).catch(() => {})
++    }
++    let chunk
++    try { chunk = base64Decode(frame.data) }
++    catch (e) { return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: item.nextSeq, reason: 'invalid base64' }).catch(() => {}) }
++    if (chunk.length !== frame.byteLength || chunk.length > state.chunkBytes || crc32(chunk) !== frame.chunkCrc32) return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: item.nextSeq, reason: 'chunk checksum/length invalid' }).catch(() => {})
++    if (!Object.prototype.hasOwnProperty.call(item.chunks, frame.seq)) {
++      if (frame.seq !== item.nextSeq) return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: item.nextSeq, reason: 'out of order' }).catch(() => {})
++      item.chunks[frame.seq] = chunk
++      item.received++
++      item.receivedBytes += chunk.length
++      item.nextSeq++
++    }
++    rawSend({ __tgw: VERSION, kind: 'ack', session: state.session, transferId: frame.transferId, seq: frame.seq, nextSeq: item.nextSeq }).catch(() => {})
++    if (item.received !== item.total) return
++    if (item.receivedBytes !== item.totalBytes) {
++      delete state.assemblies[frame.transferId]
++      return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: 0, reason: 'total length mismatch' }).catch(() => {})
++    }
++    const bytes = new Array(item.totalBytes)
++    let byteOffset = 0
++    for (let i = 0; i < item.total; i++) {
++      for (let j = 0; j < item.chunks[i].length; j++) bytes[byteOffset++] = item.chunks[i][j]
++    }
++    if (crc32(bytes) !== item.totalCrc32) {
++      delete state.assemblies[frame.transferId]
++      return rawSend({ __tgw: VERSION, kind: 'nack', session: state.session, transferId: frame.transferId, seq: frame.seq, expectedSeq: 0, reason: 'total checksum mismatch' }).catch(() => {})
++    }
++    const text = utf8Decode(bytes)
++    delete state.assemblies[frame.transferId]
++    rememberBounded(state.completed, frame.transferId, { totalCrc32: item.totalCrc32, expires: Date.now() + COMPLETED_TTL_MS }, 128)
++    rawSend({ __tgw: VERSION, kind: 'commitAck', session: state.session, transferId: frame.transferId, seq: frame.seq, totalCrc32: item.totalCrc32 }).catch(() => {})
++    if (state.onPayload) {
++      setTimeout(() => {
++        try { state.onPayload(text) } catch (e) { console.warn('[TGW2] payload listener failed') }
++      }, 0)
++    }
++  }
++
++  function receive(raw) {
++    if (typeof raw === 'string' && raw.length > 8192) return true
++    let frame = raw
++    if (typeof raw === 'string') {
++      try { frame = JSON.parse(raw) } catch (e) { return false }
++    }
++    if (!isFrame(frame)) return false
++    if (frame.kind === 'hello') {
++      if (typeof frame.session !== 'string' || frame.session.length > 80) return true
++      state.session = frame.session
++      state.chunkBytes = Math.max(128, Math.min(DEFAULT_CHUNK_BYTES, frame.maxChunk | 0))
++      state.ready = false
++      state.assemblies = {}
++      state.completed = {}
++      state.commitSeen = {}
++      failWaiters(new Error('peer changed session'))
++      const chunkBytes = state.chunkBytes
++      rawSend({ __tgw: VERSION, kind: 'helloAck', session: state.session, maxChunk: chunkBytes })
++        .then(() => { state.ready = true; emitState('ready', { session: state.session, maxChunk: chunkBytes }) })
++        .catch(e => { state.lastError = String(e && e.message || e); emitState('error', { error: state.lastError }) })
++      return true
++    }
++    if (frame.kind === 'helloRequest') return true
++    if (!state.ready || frame.session !== state.session) return true
++    if (frame.kind === 'frame') { receiveFrame(frame); return true }
++    if (frame.kind === 'ack') { settleAck(frame, true); return true }
++    if (frame.kind === 'nack') {
++      const k = frame.transferId + ':' + frame.seq
++      const w = state.ackWaiters[k]
++      if (w && frame.session === state.session) { delete state.ackWaiters[k]; w.reject(new Error(frame.reason || 'peer rejected chunk')) }
++      return true
++    }
++    if (frame.kind === 'commitAck') {
++      const w = state.commitWaiters[frame.transferId]
++      if (frame.session === state.session) {
++        const crc = String(frame.totalCrc32 || '').toLowerCase()
++        if (w) {
++          delete state.commitWaiters[frame.transferId]
++          crc === w.expectedCrc ? w.resolve(true) : w.reject(new Error('commit ACK checksum mismatch'))
++        } else rememberBounded(state.commitSeen, frame.transferId, { crc, expires: Date.now() + COMPLETED_TTL_MS }, 128)
++      }
++      return true
++    }
++    return true
++  }
++
++  function waitForAck(transferId, seq) {
++    const k = transferId + ':' + seq
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => {
++        if (state.ackWaiters[k]) { delete state.ackWaiters[k]; reject(new Error('chunk ACK timeout')) }
++      }, ACK_TIMEOUT_MS)
++      state.ackWaiters[k] = {
++        resolve: value => { clearTimeout(timer); resolve(value) },
++        reject: error => { clearTimeout(timer); reject(error) }
++      }
++    })
++  }
++
++  function waitForCommit(transferId, expectedCrc) {
++    const seen = state.commitSeen[transferId]
++    if (seen && seen.expires > Date.now()) {
++      delete state.commitSeen[transferId]
++      return seen.crc === expectedCrc ? Promise.resolve(true) : Promise.reject(new Error('commit ACK checksum mismatch'))
++    }
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => {
++        if (state.commitWaiters[transferId]) { delete state.commitWaiters[transferId]; reject(new Error('commit ACK timeout')) }
++      }, ACK_TIMEOUT_MS)
++      state.commitWaiters[transferId] = {
++        expectedCrc,
++        resolve: value => { clearTimeout(timer); resolve(value) },
++        reject: error => { clearTimeout(timer); reject(error) }
++      }
++    })
++  }
++
++  async function sendChunk(frame) {
++    let lastError
++    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
++      if (!state.ready || frame.session !== state.session) throw new Error('session lost during transfer')
++      const ack = waitForAck(frame.transferId, frame.seq)
++      try { await rawSend(frame) }
++      catch (e) {
++        const keyName = frame.transferId + ':' + frame.seq
++        const waiter = state.ackWaiters[keyName]
++        if (waiter) { delete state.ackWaiters[keyName]; waiter.reject(e) }
++      }
++      try { await ack; return }
++      catch (e) {
++        lastError = e
++        state.retryCount++
++        if (attempt >= MAX_RETRIES) break
++        await new Promise(resolve => setTimeout(resolve, 1000 * (1 << attempt)))
++      }
++    }
++    state.lastError = String(lastError && lastError.message || 'chunk retries exhausted')
++    throw new Error(state.lastError)
++  }
++
++  async function sendLogical(text) {
++    if (state.queueDepth >= 8) return Promise.reject(new Error('TG Wear send queue full'))
++    state.queueDepth++
++    const task = state.outgoing.then(async () => {
++      if (typeof text !== 'string') text = JSON.stringify(text)
++      const bytes = utf8Encode(text)
++      if (bytes.length > MAX_LOGICAL_BYTES) throw new Error('logical payload exceeds 128 KiB')
++      if (!state.ready || !state.session) throw new Error('TG Wear session not ready')
++      const transferId = 'v-' + Date.now().toString(36) + '-' + (++state.sequence).toString(36)
++      const frames = makeTransfer(text, state.session, transferId, state.chunkBytes)
++      for (let i = 0; i < frames.length - 1; i++) await sendChunk(frames[i])
++      const finalFrame = frames[frames.length - 1]
++      await sendChunk(finalFrame)
++      let committed = false
++      for (let attempt = 0; attempt <= MAX_RETRIES && !committed; attempt++) {
++        try { await waitForCommit(transferId, finalFrame.totalCrc32); committed = true }
++        catch (e) {
++          state.retryCount++
++          if (attempt >= MAX_RETRIES) throw e
++          await sendChunk(finalFrame)
++          await new Promise(resolve => setTimeout(resolve, 1000 * (1 << attempt)))
++        }
++      }
++      return { transferId, bytes: bytes.length, chunks: frames.length }
++    })
++    state.outgoing = task.catch(() => {}).finally(() => { state.queueDepth = Math.max(0, state.queueDepth - 1) })
++    return task
++  }
++
++  const api = {
++    bind(sender, onPayload, onState) {
++      state.rawSend = sender
++      state.onPayload = onPayload
++      state.onState = onState
++      return api
++    },
++    onPhysicalState: physicalState,
++    receive,
++    send: sendLogical,
++    snapshot() {
++      return { transport: state.connected, ready: state.ready, session: state.session, chunkBytes: state.chunkBytes, queued: state.queueDepth, assembling: Object.keys(state.assemblies).length, retries: state.retryCount, lastError: state.lastError }
++    },
++    reset() {
++      state.connected = false
++      state.ready = false
++      state.session = ''
++      state.localSession = ''
++      state.assemblies = {}
++      state.completed = {}
++      state.commitSeen = {}
++      failWaiters(new Error('protocol reset'))
++    }
++  }
++  shared[key] = api
++  return api
++}
++
++const protocol = createProtocol()
++export { utf8Encode, utf8Decode, base64Encode, base64Decode, crc32, makeTransfer, isFrame, createProtocol }
++export default protocol
+--- /dev/null
++++ b/tgwear-quickapp-main/test/protocol.test.js
+@@ -0,0 +1,116 @@
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import { createProtocol, makeTransfer, utf8Encode, utf8Decode, crc32 } from '../src/utils/protocol.js'
++
++const tick = ms => new Promise(resolve => setTimeout(resolve, ms))
++
++function makeWearableProtocol(chunkBytes = 2048) {
++  const watch = createProtocol({})
++  let phoneSession = 'phone-test-session'
++  const sentFrames = []
++  const delivered = []
++  let readyResolve
++  const ready = new Promise(resolve => { readyResolve = resolve })
++
++  watch.bind(frame => {
++    sentFrames.push(frame)
++    if (frame.kind === 'helloAck') setTimeout(() => readyResolve(true), 0)
++    if (frame.kind === 'frame') {
++      // A mock Android peer acknowledges each frame; commitAck is intentionally
++      // delivered just after the final chunk ACK to exercise the race window.
++      setTimeout(() => watch.receive({
++        __tgw: 2, kind: 'ack', session: phoneSession,
++        transferId: frame.transferId, seq: frame.seq, nextSeq: frame.seq + 1
++      }), 0)
++      if (frame.seq === frame.total - 1) {
++        setTimeout(() => watch.receive({
++          __tgw: 2, kind: 'commitAck', session: phoneSession,
++          transferId: frame.transferId, seq: frame.seq, totalCrc32: frame.totalCrc32
++        }), 1)
++      }
++    }
++    return Promise.resolve()
++  }, payload => delivered.push(payload))
++  watch.onPhysicalState(true, { test: true })
++  watch.receive({ __tgw: 2, kind: 'hello', session: phoneSession, maxChunk: chunkBytes })
++  return { watch, ready, sentFrames, delivered, session: () => phoneSession }
++}
++
++test('UTF-8 codec round-trips Chinese, emoji, and mixed scripts', () => {
++  const source = '私聊同步：你好，TG Wear 👋🏽 — Nagram'
++  assert.equal(utf8Decode(utf8Encode(source)), source)
++})
++
++test('frames respect byte and chunk limits, and oversize data is rejected', () => {
++  const text = '表情🙂'.repeat(700)
++  const frames = makeTransfer(text, 'session', 'transfer')
++  assert.ok(frames.length > 1 && frames.length <= 64)
++  assert.ok(frames.every(frame => frame.byteLength <= 2048))
++  assert.equal(frames.reduce((sum, frame) => sum + frame.byteLength, 0), utf8Encode(text).length)
++  assert.equal(crc32(utf8Encode(text)), frames[0].totalCrc32)
++  assert.throws(() => makeTransfer('x'.repeat(128 * 1024 + 1), 's', 'large'), /128 KiB/)
++})
++
++test('handshake negotiates and enforces a smaller frame size', async () => {
++  const pair = makeWearableProtocol(512)
++  await pair.ready
++  await tick(0)
++  const result = await pair.watch.send(JSON.stringify({ text: '甲'.repeat(2400) }))
++  assert.equal(pair.watch.snapshot().chunkBytes, 512)
++  assert.ok(result.chunks > 1)
++  assert.ok(pair.sentFrames.filter(frame => frame.kind === 'frame').every(frame => frame.byteLength <= 512))
++})
++
++test('watch sender completes chunk ACK and commitAck round trip', async () => {
++  const pair = makeWearableProtocol()
++  await pair.ready
++  await tick(0)
++  const payload = JSON.stringify({ method: 'messages.sendText', params: { peer: 'user:42', text: '你好🙂'.repeat(1800) } })
++  const result = await pair.watch.send(payload)
++  assert.ok(result.chunks > 1)
++  assert.equal(result.bytes, utf8Encode(payload).length)
++  assert.equal(pair.watch.snapshot().ready, true)
++  assert.equal(pair.watch.snapshot().queued, 0)
++})
++
++test('watch receiver delivers a reconstructed message once and re-ACKs a duplicate final frame', async () => {
++  const pair = makeWearableProtocol()
++  await pair.ready
++  await tick(0)
++  const text = JSON.stringify({ __rpc: true, id: 'req-1', method: 'messages.getHistory', params: { peer: 'user:9', text: '腕上消息🙂'.repeat(900) } })
++  const frames = makeTransfer(text, pair.session(), 'phone-transfer-1')
++  frames.forEach(frame => pair.watch.receive(frame))
++  await tick(10)
++  assert.equal(pair.delivered.length, 1)
++  assert.equal(pair.delivered[0], text)
++  const controlsBefore = pair.sentFrames.length
++  pair.watch.receive(frames[frames.length - 1])
++  await tick(0)
++  assert.equal(pair.delivered.length, 1)
++  assert.ok(pair.sentFrames.length >= controlsBefore + 2)
++  assert.ok(pair.sentFrames.slice(controlsBefore).some(frame => frame.kind === 'commitAck'))
++})
++
++test('watch receiver rejects a corrupted chunk checksum', async () => {
++  const pair = makeWearableProtocol()
++  await pair.ready
++  await tick(0)
++  const frames = makeTransfer('{"hello":"world"}', pair.session(), 'phone-transfer-bad')
++  frames[0].chunkCrc32 = '00000000'
++  pair.watch.receive(frames[0])
++  await tick(0)
++  assert.ok(pair.sentFrames.some(frame => frame.kind === 'nack' && frame.transferId === 'phone-transfer-bad'))
++  assert.equal(pair.delivered.length, 0)
++})
++
++test('watch receiver safely rejects malformed Base64 without throwing', async () => {
++  const pair = makeWearableProtocol()
++  await pair.ready
++  await tick(0)
++  const frames = makeTransfer('{"hello":"world"}', pair.session(), 'phone-transfer-base64')
++  frames[0].data = '%%%!'
++  assert.doesNotThrow(() => pair.watch.receive(frames[0]))
++  await tick(0)
++  assert.ok(pair.sentFrames.some(frame => frame.kind === 'nack' && frame.transferId === 'phone-transfer-base64'))
++  assert.equal(pair.delivered.length, 0)
++})
+--- /dev/null
++++ b/tgwear-quickapp-main/test/store.test.js
+@@ -0,0 +1,38 @@
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import store from '../src/utils/store.js'
++
++test('page store delegates to the single app-owned facade', async () => {
++  const calls = []
++  const facade = {
++    bridgeStoreGet(key) { calls.push(['get', key]); return key === 'dialogs' ? [{ peer: 'user:7' }] : 'root-value' },
++    bridgeStoreSet(key, value) { calls.push(['set', key, value]); return 'stored' },
++    bridgeStoreGetDialog(peer) { calls.push(['getDialog', peer]); return [{ id: 4 }] },
++    bridgeStoreAppendDialog(peer, messages, prepend) { calls.push(['appendDialog', peer, messages.length, prepend]); return [{ id: 5 }] },
++    bridgeStoreUpsertMessage(peer, message) { calls.push(['upsertMessage', peer, message.id]); return true },
++    bridgeStoreReplaceMessageId(peer, localId, message, operationId) { calls.push(['replaceMessageId', peer, localId, operationId]); return true },
++    bridgeStoreRemoveMessages(peer, ids) { calls.push(['removeMessages', peer, ids.length]); return true },
++    bridgeStoreUpsertDialog(dialog) { calls.push(['upsertDialog', dialog.peer]); return true },
++    bridgeStoreClearDialogs() { calls.push(['clearDialogs']); return true },
++    bridgeStoreClearSession() { calls.push(['clearSession']); return true },
++    bridgeStoreLoadSettings() { calls.push(['loadSettings']); return { fontScale: 1 } },
++    bridgeStoreSaveSettings() { calls.push(['saveSettings']); return true },
++    bridgeStoreSnapshot() { calls.push(['snapshot']); return { peers: 1 } }
++  }
++
++  assert.equal(store.attachApp(facade), true)
++  assert.equal(store.get('session'), 'root-value')
++  assert.equal(store.set('session', 'new-session'), 'stored')
++  assert.equal(store.getDialog('user:7')[0].id, 4)
++  assert.equal(store.appendDialog('user:7', [{ id: 5 }], true)[0].id, 5)
++  assert.equal(store.upsertMessage('user:7', { id: 6 }), true)
++  assert.equal(store.replaceMessageId('user:7', -6, { id: 6 }, 'op-6'), true)
++  assert.equal(store.removeMessages('user:7', [6]), true)
++  assert.equal(store.upsertDialog({ peer: 'user:7' }), true)
++  assert.equal(store.clearDialogs(), true)
++  assert.equal(store.clearSession(), true)
++  assert.deepEqual(await store.loadSettings(), { fontScale: 1 })
++  assert.equal(store.saveSettings(), true)
++  assert.deepEqual(store.snapshot(), { peers: 1 })
++  assert.ok(calls.length >= 12)
++})

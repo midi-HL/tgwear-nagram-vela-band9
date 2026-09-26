@@ -1,0 +1,4 @@
+include ':TMessagesProj'
+include ':openpgp-api'
+include ':jlatexmath'
+project(':jlatexmath').projectDir = file('TMessagesProj/lib/jlatexmath/jlatexmath')

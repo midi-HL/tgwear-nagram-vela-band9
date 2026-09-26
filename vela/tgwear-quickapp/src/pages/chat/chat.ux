@@ -1,0 +1,614 @@
+<import name="input-method" src="../../components/InputMethod/InputMethod.ux"></import>
+<import name="message-menu" src="../../components/MessageMenu/MessageMenu.ux"></import>
+
+<template>
+  <div class="page">
+    <!-- 顶部 header（对齐 ebook o66） -->
+    <image src="/common/images/hd.png" static
+           style="position:absolute;left:0px;top:0px;width:212px;height:82px;" />
+    <image src="/common/images/back.png" static @click="goBack"
+           style="position:absolute;left:8px;top:24px;width:34px;height:34px;" />
+    <text static
+          style="position:absolute;top:36px;left:46px;width:158px;font-size:22px;font-weight:bold;color:#ffffff;text-overflow:ellipsis;lines:1;">{{title}}</text>
+
+    <!-- 消息列表 -->
+    <list class="msg-list" id="msgList" style="top:82px;height:{{hideKeyboard ? 316 : 160}}px;">
+      <!-- 加载更多 -->
+      <list-item if="{{hasMore && messages.length > 0}}" @click="loadMore" class="load-more-item" type="more">
+        <text style="font-size:14px;color:rgba(255,255,255,0.6);">加载更多</text>
+      </list-item>
+
+      <!-- 消息条目（长按弹出操作菜单） -->
+      <list-item class="msg-row" for="{{messages}}" type="msg" @longpress="onMessageLongPress($item)">
+        <div class="msg-bubble {{$item.out ? 'msg-out' : 'msg-in'}}">
+          <text class="msg-sender" if="{{$item.sender}}">{{$item.sender}}</text>
+          <text class="msg-text">{{$item.text}}</text>
+          <text class="msg-state" if="{{$item.stateText}}">{{$item.stateText}}</text>
+        </div>
+      </list-item>
+
+      <!-- 空状态 -->
+      <list-item if="{{messages.length === 0 && !loading}}" class="empty-item" type="empty">
+        <text style="font-size:14px;color:rgba(255,255,255,0.4);">暂无消息</text>
+      </list-item>
+
+      <!-- 加载中 -->
+      <list-item if="{{loading && messages.length === 0}}" class="empty-item" type="loading">
+        <text style="font-size:14px;color:rgba(255,255,255,0.6);">加载中...</text>
+      </list-item>
+    </list>
+
+    <!-- 输入栏（键盘隐藏时显示） -->
+    <div class="input-bar" if="{{hideKeyboard}}">
+      <div class="input-preview" @click="openKeyboard">
+        <text class="input-reply-hint" if="{{replyTo}}">回复中…</text>
+        <text class="input-text" if="{{draft}}">{{draft}}</text>
+        <text class="input-placeholder" if="{{!draft && !replyTo}}">输入消息...</text>
+      </div>
+      <div class="send-btn" @click="send">
+        <text class="send-text">发送</text>
+      </div>
+    </div>
+
+    <!-- 消息操作菜单 -->
+    <message-menu
+      hide="{{!menuVisible}}"
+      title="{{menuTitle}}"
+      can-reply="{{menuCanReply}}"
+      can-edit="{{menuCanEdit}}"
+      can-forward="{{menuCanForward}}"
+      can-pin="{{menuCanPin}}"
+      can-delete="{{menuCanDelete}}"
+      @reply="menuReply"
+      @edit="menuEdit"
+      @forward="menuForward"
+      @pin="menuPin"
+      @delete="menuDelete"
+      @cancel="closeMenu"></message-menu>
+
+    <!-- 自定义键盘 -->
+    <input-method
+      hide="{{hideKeyboard}}"
+      keyboardtype.static="QWERTY"
+      vibratemode.static="short"
+      screentype="{{kbScreenType}}"
+      @complete="onInput"
+      @delete="onDelete"
+      @visibilityChange="onVisibilityChange" />
+  </div>
+</template>
+
+<style>
+.page {
+  width: 212px;
+  height: 520px;
+  background-color: #000000;
+}
+.msg-list {
+  position: absolute;
+  left: 0px;
+  width: 212px;
+  padding: 6px 8px;
+}
+.msg-row {
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-bottom: 6px;
+  background-color: transparent;
+}
+.msg-bubble {
+  max-width: 168px;
+  padding: 8px 12px;
+  border-radius: 14px;
+  background-color: #262626;
+}
+.msg-out {
+  align-self: flex-end;
+  background-color: #2ea0ff;
+}
+.msg-in {
+  align-self: flex-start;
+  background-color: #262626;
+}
+.msg-text {
+  font-size: 16px;
+  color: #ffffff;
+  lines: 6;
+}
+.msg-sender {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.55);
+  lines: 1;
+  text-overflow: ellipsis;
+  margin-bottom: 2px;
+}
+.msg-state {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  lines: 1;
+  margin-top: 2px;
+}
+.empty-item {
+  width: 100%;
+  align-items: center;
+  flex-direction: column;
+  padding: 40px 0px;
+  background-color: transparent;
+}
+.load-more-item {
+  width: 100%;
+  height: 40px;
+  align-items: center;
+  justify-content: center;
+  background-color: transparent;
+}
+.input-bar {
+  position: absolute;
+  left: 0px;
+  top: 398px;
+  width: 212px;
+  height: 100px;
+  flex-direction: row;
+  align-items: center;
+  padding: 0px 8px;
+  background-color: #000000;
+  border-top-color: rgba(255, 255, 255, 0.08);
+  border-top-width: 1px;
+}
+.input-preview {
+  flex: 1;
+  height: 44px;
+  background-color: #262626;
+  border-radius: 22px;
+  padding: 0px 14px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  margin-right: 8px;
+}
+.input-text {
+  font-size: 16px;
+  color: #ffffff;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+.input-placeholder {
+  font-size: 16px;
+  color: rgba(255, 255, 255, 0.4);
+}
+.input-reply-hint {
+  font-size: 11px;
+  color: #2ea0ff;
+  lines: 1;
+}
+.send-btn {
+  width: 60px;
+  height: 44px;
+  background-color: #2ea0ff;
+  border-radius: 22px;
+  align-items: center;
+  justify-content: center;
+}
+.send-text {
+  font-size: 16px;
+  font-weight: bold;
+  color: #ffffff;
+}
+
+/* 圆屏适配：466 等圆形手表 */
+@media (shape: circle) {
+  .msg-bubble {
+    max-width: 320px;
+  }
+}
+
+/* 胶囊屏适配 */
+@media (shape: pill-shaped) {
+  .msg-bubble {
+    max-width: 240px;
+  }
+}
+</style>
+
+<script>
+import api from '../../utils/api'
+import store from '../../utils/store'
+import interconn from '../../utils/interconn'
+import { nowTimeString, messageText } from '../../utils/format'
+
+let messageHandler = null
+let sentHandler = null
+let updatedHandler = null
+let historyPageHandler = null
+let historyErrorHandler = null
+let invalidationHandler = null
+
+export default {
+  data: {
+    peer: '',
+    title: '',
+    nowTime: '',
+    messages: [],
+    draft: '',
+    replyTo: 0,
+    hideKeyboard: true,
+    kbScreenType: 'rect',
+    loading: false,
+    hasMore: false,
+    // 长按菜单
+    menuVisible: false,
+    menuTitle: '消息操作',
+    menuMessage: null,
+    menuCanReply: false,
+    menuCanEdit: false,
+    menuCanForward: false,
+    menuCanPin: false,
+    menuCanDelete: true,
+    // 内部
+    _offsetId: 0,
+    _sending: false,
+    _operationId: ''
+  },
+
+  onInit() {
+    const app = this.$app && this.$app.$def
+    if (!api.attachApp(app)) interconn.init()
+    store.attachApp(app)
+    const router = require('@system.router')
+    const params = (router && router.getParams && router.getParams()) || {}
+    this.peer = params.peer || ''
+    this.title = params.title || '会话'
+    this.nowTime = nowTimeString()
+    this._detectScreenShape()
+
+    // 先用本地缓存填充，避免白屏
+    const cached = store.getDialog(this.peer) || []
+    this.messages = cached.slice().map(this._mapMsg)
+
+    this._setupHandlers()
+  },
+
+  _detectScreenShape() {
+    try {
+      const device = require('@system.device')
+      device.getInfo({
+        success: (ret) => {
+          if (ret && ret.screenShape === 'circle') {
+            this.kbScreenType = 'circle'
+          } else if (ret && ret.screenShape === 'pill-shaped') {
+            this.kbScreenType = 'pill-shaped'
+          } else {
+            this.kbScreenType = 'rect'
+          }
+        },
+        fail: () => { this.kbScreenType = 'rect' }
+      })
+    } catch (e) {
+      this.kbScreenType = 'rect'
+    }
+  },
+
+  onShow() {
+    this.nowTime = nowTimeString()
+    if (this.messages.length === 0) {
+      this.loadHistory(true)
+    } else {
+      this._markLastRead()
+      this._scrollToBottom()
+    }
+  },
+
+  onDestroy() {
+    if (messageHandler) { messageHandler(); messageHandler = null }
+    if (sentHandler) { sentHandler(); sentHandler = null }
+    if (updatedHandler) { updatedHandler(); updatedHandler = null }
+    if (historyPageHandler) { historyPageHandler(); historyPageHandler = null }
+    if (historyErrorHandler) { historyErrorHandler(); historyErrorHandler = null }
+    if (invalidationHandler) { invalidationHandler(); invalidationHandler = null }
+  },
+
+  _setupHandlers() {
+    if (messageHandler) messageHandler()
+    if (sentHandler) sentHandler()
+    if (updatedHandler) updatedHandler()
+    if (historyPageHandler) historyPageHandler()
+    if (historyErrorHandler) historyErrorHandler()
+    if (invalidationHandler) invalidationHandler()
+
+    // 新消息 / 被编辑的消息
+    // 说明：Nagram 中「消息被编辑」同样走 didReceiveNewMessages，
+    // 因此必须按 id upsert，直接 append 会让编辑后出现重复气泡。
+    messageHandler = api.on('update.newMessage', (data) => {
+      if (!data || data.peer !== this.peer) return
+      const msg = data.message
+      if (!msg) return
+      const mapped = this._mapMsg(msg)
+      const idx = this.messages.findIndex(m => m.id === mapped.id)
+      if (idx >= 0) {
+        this.messages[idx] = mapped
+      } else {
+        this.messages.push(mapped)
+        if (msg.id > 0) api.markRead(this.peer, msg.id).catch(() => {})
+        this._scrollToBottom()
+      }
+      store.upsertMessage(this.peer, msg)
+    })
+
+    // 出站消息确认：local_id（负数）→ server id
+    sentHandler = api.on('update.messageSent', (data) => {
+      if (!data || data.peer !== this.peer) return
+      const idx = this.messages.findIndex(m => String(m.id) === String(data.local_id)
+        || (!!data.operation_id && m.operation_id === data.operation_id))
+      if (data.message) {
+        if (idx >= 0) this.messages[idx] = this._mapMsg(data.message)
+        else this.messages.push(this._mapMsg(data.message))
+      } else if (idx >= 0) {
+        this.messages[idx].id = data.message_id
+        this.messages[idx].stateText = ''
+      }
+      store.replaceMessageId(this.peer, data.local_id, data.message || null, data.operation_id)
+      this.messages.sort((a, b) => (Number(a.date) - Number(b.date)) || (Number(a.id) - Number(b.id)))
+    })
+
+    // 消息被删除
+    updatedHandler = api.on('update.messageUpdated', (data) => {
+      if (!data) return
+      if (data.peer && data.peer !== this.peer) return
+      const ids = data.message_ids || []
+      if (!ids.length) {
+        this.loadHistory(true)
+        return
+      }
+      const idSet = new Set(ids)
+      this.messages = this.messages.filter(m => !idSet.has(m.id))
+      store.removeMessages(this.peer, ids)
+    })
+    historyPageHandler = api.on('update.historyPage', data => {
+      if (!data || data.peer !== this.peer || !Array.isArray(data.messages)) return
+      store.appendDialog(this.peer, data.messages, true)
+      this.messages = store.getDialog(this.peer).map(this._mapMsg)
+      this.hasMore = !!data.has_more
+      this._offsetId = Number(data.next_offset_id) || 0
+      this._scrollToBottom()
+    })
+    historyErrorHandler = api.on('update.historyError', data => {
+      if (data && data.peer === this.peer) this.showToast('同步历史失败：' + (data.message || '网络错误'))
+    })
+    invalidationHandler = api.on('update.messageCacheInvalidated', data => {
+      const ids = data && data.message_ids
+      if (Array.isArray(ids) && ids.some(id => this.messages.some(message => String(message.id) === String(id)))) {
+        this.loadHistory(true)
+      }
+    })
+  },
+
+  _mapMsg(m) {
+    const sending = !!m.sending
+    const failed = !!m.failed
+    return {
+      id: m.id,
+      out: !!m.out,
+      sender: m.out ? '' : (m.sender || ''),
+      text: messageText(m),
+      date: m.date,
+      operation_id: m.operation_id || '',
+      stateText: m.out ? (failed ? '发送失败' : (sending ? '发送中' : '')) : ''
+    }
+  },
+
+  _markLastRead() {
+    const last = this.messages[this.messages.length - 1]
+    if (last && last.id > 0) {
+      api.markRead(this.peer, last.id).catch(() => {})
+    }
+  },
+
+  _scrollToBottom() {
+    const el = this.$element('msgList')
+    if (el && el.scrollTo) {
+      setTimeout(() => {
+        try {
+          const lastIndex = Math.max(0, this.messages.length - 1)
+          el.scrollTo({ index: lastIndex, behavior: 'auto' })
+        } catch (e) {}
+      }, 50)
+    }
+  },
+
+  async loadHistory(reset) {
+    if (this.loading) return
+    this.loading = true
+    try {
+      if (reset) this._offsetId = 0
+      const result = await api.getHistory(this.peer, 30, this._offsetId)
+      const list = (result && result.messages) || []
+      // Merge with any network page that may have arrived before this cached RPC response.
+      if (list.length) store.appendDialog(this.peer, list, true)
+      this.messages = store.getDialog(this.peer).map(this._mapMsg)
+      this.hasMore = !!((result && result.has_more) || (result && result.refreshing))
+      if (list.length) this._offsetId = list[0].id || this._offsetId
+      if (reset) {
+        this._scrollToBottom()
+        this._markLastRead()
+      }
+    } catch (e) {
+      this.showToast((e && e.msg) || '加载失败')
+    } finally {
+      this.loading = false
+    }
+  },
+
+  loadMore() {
+    this.loadHistory(false)
+  },
+
+  /* ============ 输入 ============ */
+
+  openKeyboard() {
+    this.hideKeyboard = false
+  },
+
+  onInput(evt) {
+    const content = evt && evt.detail && evt.detail.content
+    if (!content) return
+    if (this.draft.length >= 500) {
+      this.showToast('消息过长')
+      return
+    }
+    this.draft += content
+    this._operationId = ''
+    // 节流上报"正在输入"（每 8 个字符一次），避免占用通道
+    if (this.draft.length % 8 === 1) {
+      api.setTyping(this.peer, 0).catch(() => {})
+    }
+  },
+
+  onDelete() {
+    if (!this.draft) return
+    this.draft = this.draft.slice(0, -1)
+    this._operationId = ''
+  },
+
+  onVisibilityChange(evt) {
+    const visible = evt && evt.detail && evt.detail.visible
+    if (!visible) this.hideKeyboard = true
+  },
+
+  async send() {
+    if (this._sending) return
+    const text = (this.draft || '').trim()
+    if (!text) {
+      this.showToast('请输入消息')
+      return
+    }
+    if (!this.peer) {
+      this.showToast('会话无效')
+      return
+    }
+    this._sending = true
+    try {
+      if (!this._operationId) this._operationId = 'wear-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+      const operationId = this._operationId
+      const result = this.replyTo
+        ? await api.reply(this.peer, text, this.replyTo, operationId)
+        : await api.sendText(this.peer, text, 0, operationId)
+      const msg = (result && result.message) || {
+        id: -Date.now(),
+        out: true,
+        text: text,
+        date: Math.floor(Date.now() / 1000),
+        sending: true
+      }
+      if (!this.messages.some(m => m.id === msg.id)) {
+        this.messages.push(this._mapMsg(msg))
+        store.upsertMessage(this.peer, msg)
+      }
+      this.draft = ''
+      this.replyTo = 0
+      this._operationId = ''
+      this._scrollToBottom()
+    } catch (e) {
+      this.showToast((e && e.msg) || '发送失败')
+    } finally {
+      this._sending = false
+    }
+  },
+
+  /* ============ 长按操作菜单 ============ */
+
+  onMessageLongPress(item) {
+    if (!item) return
+    this.menuMessage = item
+    // 只有拿到服务端 id 的消息才能操作（本地负数 id 尚未确认）
+    const hasServerId = typeof item.id === 'number' && item.id > 0
+    this.menuCanReply = hasServerId && !item.out
+    this.menuCanEdit = hasServerId && item.out
+    this.menuCanForward = hasServerId
+    this.menuCanPin = hasServerId && !item.out
+    this.menuCanDelete = hasServerId
+    this.menuTitle = item.text ? messageText({ text: item.text }, 12) : '消息操作'
+    this.menuVisible = true
+  },
+
+  closeMenu() {
+    this.menuVisible = false
+    this.menuMessage = null
+  },
+
+  menuReply() {
+    const target = this.menuMessage
+    this.closeMenu()
+    if (!target) return
+    this.replyTo = target.id
+    this.showToast('已设为回复目标')
+  },
+
+  async menuEdit() {
+    const target = this.menuMessage
+    this.closeMenu()
+    if (!target) return
+    try {
+      await api.editMessage(this.peer, target.id, target.text)
+      this.showToast('已提交编辑')
+    } catch (e) {
+      this.showToast((e && e.msg) || '编辑失败')
+    }
+  },
+
+  async menuForward() {
+    const target = this.menuMessage
+    this.closeMenu()
+    if (!target) return
+    // 手环交互空间有限：转发到会话列表中的第一个其他会话，一步完成
+    const dialogs = store.get('dialogs') || []
+    const other = dialogs.find(d => d.peer && d.peer !== this.peer)
+    if (!other) {
+      this.showToast('没有其他会话')
+      return
+    }
+    try {
+      await api.forwardMessage(this.peer, target.id, other.peer)
+      this.showToast('已转发到 ' + (other.title || other.peer))
+    } catch (e) {
+      this.showToast((e && e.msg) || '转发失败')
+    }
+  },
+
+  async menuPin() {
+    const target = this.menuMessage
+    this.closeMenu()
+    if (!target) return
+    try {
+      await api.pinMessage(this.peer, target.id, false)
+      this.showToast('已置顶')
+    } catch (e) {
+      this.showToast((e && e.msg) || '置顶失败')
+    }
+  },
+
+  async menuDelete() {
+    const target = this.menuMessage
+    this.closeMenu()
+    if (!target) return
+    try {
+      await api.deleteMessage(this.peer, target.id, true)
+      this.messages = this.messages.filter(m => m.id !== target.id)
+      store.removeMessages(this.peer, [target.id])
+      this.showToast('已删除')
+    } catch (e) {
+      this.showToast((e && e.msg) || '删除失败')
+    }
+  },
+
+  goBack() {
+    const router = require('@system.router')
+    router.back()
+  },
+
+  showToast(msg) {
+    const prompt = require('@system.prompt')
+    prompt.showToast({ message: msg, duration: 1500 })
+  }
+}
+</script>

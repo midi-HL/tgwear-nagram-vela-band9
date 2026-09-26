@@ -1,0 +1,3 @@
+# Local-only Xiaomi Wearable SDK input
+
+Place the Xiaomi Wearable SDK AAR/JAR obtained from an authorized source in this directory before building. This repository intentionally does not redistribute the proprietary SDK binary. The Gradle module consumes local `*.aar` and `*.jar` files here. Confirm license, checksum, and API compatibility locally; do not commit the binary unless redistribution is explicitly allowed.

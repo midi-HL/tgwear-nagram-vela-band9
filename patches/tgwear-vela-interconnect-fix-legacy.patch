@@ -1,0 +1,334 @@
+--- a/src/app.ux
++++ b/src/app.ux
+@@ -16,9 +16,6 @@
+         store.set('connectionState', state)
+       })
+ 
+-      // 加载设置
+-      await store.loadSettings()
+-
+       // 订阅手机端推送
+       // 1) 新消息 / 被编辑的消息：Nagram 两者都走 didReceiveNewMessages，
+       //    因此统一按 id 做 upsert（追加会导致编辑后出现重复气泡）。
+@@ -62,11 +59,30 @@
+         if (!data || !data.nonce) return
+         store.set('connectionChallenge', data)
+         console.log('[connection] phone challenge received')
++        try {
++          // 挑战可能在 splash/chat 页面到达；直接带用户进入可确认页面。
++          const router = require('@system.router')
++          router.push({ uri: 'pages/connection', params: { nonce: data.nonce } })
++        } catch (e) {
++          console.error('[connection] could not open confirmation page:', e)
++        }
+       })
++
++      // 先注册消息监听，再读异步设置；避免启动期间收到的手机挑战被丢弃。
++      await store.loadSettings()
+     } catch (e) {
+       console.error('[app.onCreate] error:', e)
+     }
+   },
++  bridgeInit() { return interconn.init() },
++  bridgeSend(data) { return interconn.send(data) },
++  bridgeGetReadyState() { return interconn.getReadyState() },
++  bridgeQueryReadyState() { return interconn.queryReadyState() },
++  bridgeDiagnose(timeout) { return interconn.diagnose(timeout) },
++  bridgeOnMessage(handler) { return interconn.onMessage(handler) },
++  bridgeOnState(handler) { return interconn.onState(handler) },
++  bridgeCall(method, params) { return api._call(method, params) },
++  bridgeOn(event, handler) { return api.on(event, handler) },
+   onDestroy() {
+     console.log('[app] destroyed')
+   },
+--- a/src/pages/splash/splash.ux
++++ b/src/pages/splash/splash.ux
+@@ -52,6 +52,8 @@
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
+   },
+ 
+   onShow() {
+@@ -86,7 +88,7 @@
+     this.iconPath = '/common/images/empty.png'
+ 
+     try {
+-      const result = await interconn.diagnosis(8000)
++      const result = await interconn.diagnose(8000)
+       // status: 0=OK, 204=timeout, 1001=app not installed, 1000=others
+       if (result.status === 0) {
+         await this.checkAuth()
+--- a/src/pages/connection/connection.ux
++++ b/src/pages/connection/connection.ux
+@@ -46,6 +46,9 @@
+ import { nowTimeString } from '../../utils/format'
+ 
+ export default {
++  protected: {
++    nonce: ''
++  },
+   data: {
+     nowTime: '',
+     systemState: '正在读取',
+@@ -60,6 +63,12 @@
+     _offState: null,
+     _busy: false
+   },
++  onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
++    this.challengeNonce = this.nonce || ''
++    this.challengePending = !!this.challengeNonce
++  },
+   onShow() {
+     this.updateTime()
+     if (this._timer) clearInterval(this._timer)
+@@ -85,7 +94,7 @@
+   updateTime() { this.nowTime = nowTimeString() },
+   refreshChallenge() {
+     const challenge = store.get('connectionChallenge')
+-    this.challengeNonce = challenge && challenge.nonce ? challenge.nonce : ''
++    this.challengeNonce = this.nonce || (challenge && challenge.nonce ? challenge.nonce : '')
+     this.challengePending = !!this.challengeNonce
+     if (this.challengePending) this.roundTripText = '收到手机挑战，请点击确认'
+   },
+@@ -136,6 +145,7 @@
+       if (result && result.ok) {
+         this.roundTripText = '手机↔手环双向通信成功'
+         this.challengePending = false
++        this.challengeNonce = ''
+         store.set('connectionChallenge', null)
+         this.detail = '手机已收到手环确认，双向应用消息往返通过。'
+       } else {
+--- a/src/pages/chats/chats.ux
++++ b/src/pages/chats/chats.ux
+@@ -161,6 +161,7 @@
+ <script>
+ import api from '../../utils/api'
+ import store from '../../utils/store'
++import interconn from '../../utils/interconn'
+ import { formatTime, messagePreview, nowTimeString, initial } from '../../utils/format'
+ 
+ let messageHandler = null
+@@ -176,6 +177,8 @@
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
+     this._offsetId = 0
+     // 初始用 store 中的数据填充（页面间返回时立即显示）
+     const stored = store.get('dialogs') || []
+--- a/src/pages/chat/chat.ux
++++ b/src/pages/chat/chat.ux
+@@ -214,6 +214,7 @@
+ <script>
+ import api from '../../utils/api'
+ import store from '../../utils/store'
++import interconn from '../../utils/interconn'
+ import { nowTimeString, messageText } from '../../utils/format'
+ 
+ let messageHandler = null
+@@ -247,6 +248,8 @@
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
+     const router = require('@system.router')
+     const params = (router && router.getParams && router.getParams()) || {}
+     this.peer = params.peer || ''
+--- a/src/pages/setting/setting.ux
++++ b/src/pages/setting/setting.ux
+@@ -120,6 +120,7 @@
+ <script>
+ import store from '../../utils/store'
+ import api from '../../utils/api'
++import interconn from '../../utils/interconn'
+ import { nowTimeString } from '../../utils/format'
+ 
+ export default {
+@@ -132,6 +133,8 @@
+   },
+ 
+   onInit() {
++    const app = this.$app && this.$app.$def
++    if (!api.attachApp(app)) interconn.init()
+     this.refreshFromStore()
+   },
+ 
+--- a/src/utils/api.js
++++ b/src/utils/api.js
+@@ -3,6 +3,7 @@
+ let seq = 0
+ const pending = new Map() // id -> {resolve, reject, timer}
+ const RPC_TIMEOUT = 30000
++let appFacade = null
+ 
+ // 简易事件总线
+ const listeners = {}
+@@ -21,6 +22,7 @@
+ }
+ 
+ function call(method, params = {}) {
++  if (appFacade) return appFacade.bridgeCall(method, params)
+   const id = ++seq
+   const req = { id, method, params }
+ 
+@@ -43,7 +45,7 @@
+ }
+ 
+ // 处理手机端 RPC 响应和事件推送
+-interconn.onMessage(payload => {
++const removeMessageListener = interconn.onMessage(payload => {
+   if (!payload) return
+   // RPC 响应
+   if (payload.id !== undefined && payload.__rpc !== true) {
+@@ -63,6 +65,15 @@
+ })
+ 
+ export default {
++  attachApp(facade) {
++    if (!facade || typeof facade.bridgeCall !== 'function') return false
++    // 页面 bundle 与 app bundle 各自拥有模块作用域；RPC 响应和事件统一交给 app 根实例。
++    if (!appFacade && removeMessageListener) removeMessageListener()
++    appFacade = facade
++    interconn.attachApp(facade)
++    return true
++  },
++  _call(method, params = {}) { return call(method, params) },
+   // ==== 会话 ====
+   getDialogs(limit = 30, offsetId = 0, folderId = 0) {
+     return call('dialogs.get', { limit, offset_id: offsetId, folder_id: folderId })
+@@ -132,7 +143,10 @@
+   },
+ 
+   // 事件订阅
+-  on(event, handler) { return eventBus.on(event, handler) },
++  on(event, handler) {
++    if (appFacade) return appFacade.bridgeOn(event, handler)
++    return eventBus.on(event, handler)
++  },
+   // 触发事件（内部使用）
+   _emit(event, data) { eventBus.emit(event, data) }
+ }
+--- a/src/utils/interconn.js
++++ b/src/utils/interconn.js
+@@ -2,10 +2,23 @@
+ 
+ let conn = null
+ let readyState = 2 // 1=connected, 2=disconnected
++let appFacade = null
+ const messageHandlers = new Set()
+ const stateHandlers = new Set()
+ 
++function attachApp(facade) {
++  if (!facade || typeof facade.bridgeInit !== 'function') return false
++  appFacade = facade
++  appFacade.bridgeInit()
++  messageHandlers.forEach(handler => appFacade.bridgeOnMessage(handler))
++  stateHandlers.forEach(handler => appFacade.bridgeOnState(handler))
++  messageHandlers.clear()
++  stateHandlers.clear()
++  return true
++}
++
+ function init() {
++  if (appFacade) return appFacade.bridgeInit()
+   if (conn) return conn
+   conn = interconnect.instance()
+ 
+@@ -39,42 +52,62 @@
+   return conn
+ }
+ 
+-export default {
++const api = {
+   init,
++  attachApp,
+   send(data) {
+-    if (!conn || readyState !== 1) {
+-      return Promise.reject({ code: 1006, msg: 'not connected' })
+-    }
+-    return new Promise((resolve, reject) => {
+-      conn.send({
+-        data: { __rpc: true, ...data },
+-        success: resolve,
+-        fail: (err, code) => reject({ code, msg: err })
++    if (appFacade) return appFacade.bridgeSend(data)
++    const active = init()
++    // 用 Vela 系统状态作为发送判据，避免漏收 onopen 后本地缓存仍显示断开。
++    return api.queryReadyState().then(state => {
++      if (!state || state.status !== 1) {
++        readyState = 2
++        throw { code: 1006, msg: 'not connected' }
++      }
++      readyState = 1
++      return new Promise((resolve, reject) => {
++        active.send({
++          data: { __rpc: true, ...data },
++          success: resolve,
++          fail: (err, code) => reject({ code, msg: err })
++        })
+       })
+     })
+   },
+   onMessage(handler) {
++    if (appFacade) return appFacade.bridgeOnMessage(handler)
+     messageHandlers.add(handler)
+     return () => messageHandlers.delete(handler)
+   },
+   onState(handler) {
++    if (appFacade) return appFacade.bridgeOnState(handler)
+     stateHandlers.add(handler)
+     return () => stateHandlers.delete(handler)
+   },
+-  getReadyState() { return readyState },
++  getReadyState() {
++    if (appFacade) return appFacade.bridgeGetReadyState()
++    return readyState
++  },
+   queryReadyState() {
+-    if (!conn) return Promise.reject({ code: 1006, msg: 'conn not init' })
++    if (appFacade) return appFacade.bridgeQueryReadyState()
++    const active = init()
+     return new Promise((resolve, reject) => {
+-      conn.getReadyState({
+-        success: resolve,
++      active.getReadyState({
++        success: (state) => {
++          readyState = state && state.status === 1 ? 1 : 2
++          resolve(state)
++        },
+         fail: (data, code) => reject({ code: code || (data && data.code), msg: (data && (data.data || data.msg)) || 'getReadyState failed' })
+       })
+     })
+   },
+   diagnose(timeout = 10000) {
++    if (appFacade) return appFacade.bridgeDiagnose(timeout)
++    const active = init()
+     return new Promise((resolve, reject) => {
+-      if (!conn) return reject({ code: 1006, msg: 'conn not init' })
+-      conn.diagnosis({ timeout, success: resolve, fail: reject })
++      active.diagnosis({ timeout, success: resolve, fail: reject })
+     })
+   }
+ }
++
++export default api
+--- a/src/manifest.json
++++ b/src/manifest.json
+@@ -1,8 +1,8 @@
+ {
+   "package": "com.hrk.tgwear",
+   "name": "TG Wear",
+-  "versionName": "0.1.0",
+-  "versionCode": 1,
++  "versionName": "0.1.2",
++  "versionCode": 3,
+   "minPlatformVersion": 1100,
+   "icon": "/common/icon.png",
+   "simulationVersion": "default",

@@ -1,0 +1,99 @@
+<script>
+import interconn from './utils/interconn'
+import api from './utils/api'
+import store from './utils/store'
+
+let removers = []
+
+function subscribe(event, handler) {
+  const remove = api.on(event, handler)
+  if (typeof remove === 'function') removers.push(remove)
+}
+
+export default {
+  onCreate() {
+    // The app bundle owns the only transport, API dispatcher and store.
+    api.initializeRoot()
+    interconn.onState((state, info) => {
+      store.set('connectionState', state)
+      store.set('connectionStatus', info || null)
+      console.log('[TGWear] protocol state changed:', state)
+    })
+
+    subscribe('update.newMessage', data => {
+      if (!data || !data.message || !data.peer) return
+      store.upsertMessage(data.peer, data.message)
+      if (data.dialog) store.upsertDialog(data.dialog)
+    })
+    subscribe('update.messageSent', data => {
+      if (!data || !data.peer) return
+      store.replaceMessageId(data.peer, data.local_id, data.message || {
+        id: data.message_id, out: true, sending: false, date: Math.floor(Date.now() / 1000)
+      }, data.operation_id)
+    })
+    subscribe('update.messageUpdated', data => {
+      if (data) store.removeMessages(data.peer || '', data.message_ids || [])
+    })
+    subscribe('update.dialogsPage', data => {
+      if (data && Array.isArray(data.dialogs)) data.dialogs.forEach(dialog => store.upsertDialog(dialog))
+    })
+    subscribe('update.dialogsError', data => {
+      if (data) console.warn('[dialogs] network refresh failed:', data.message || 'unknown')
+    })
+    subscribe('update.dialogsInvalidated', () => store.set('dialogsDirty', true))
+    subscribe('update.historyPage', data => {
+      if (!data || !data.peer || !Array.isArray(data.messages)) return
+      store.appendDialog(data.peer, data.messages, true)
+    })
+    subscribe('update.historyError', data => {
+      if (data) console.warn('[history] network refresh failed for peer:', data.peer || 'unknown')
+    })
+    subscribe('update.connectionState', data => {
+      if (data) store.set('connectionStatus', data)
+    })
+    subscribe('update.phoneProbe', data => {
+      if (!data || !data.nonce) return
+      store.set('connectionChallenge', data)
+      try {
+        const router = require('@system.router')
+        router.push({ uri: 'pages/connection', params: { nonce: data.nonce } })
+      } catch (e) { console.error('[connection] confirmation route failed') }
+    })
+
+    // Load non-sensitive user preferences after all messages/events are subscribed.
+    store.loadSettings().catch(() => {})
+  },
+
+  bridgeInit() { return interconn.init() },
+  bridgeSend(data) { return interconn.send(data) },
+  bridgeGetReadyState() { return interconn.getReadyState() },
+  bridgeQueryReadyState() { return interconn.queryReadyState() },
+  bridgeDiagnose(timeout) { return interconn.diagnose(timeout) },
+  bridgeOnMessage(handler) { return interconn.onMessage(handler) },
+  bridgeOnState(handler) { return interconn.onState(handler) },
+  bridgeOnPhysicalState(handler) { return interconn.onPhysicalState(handler) },
+  bridgeProtocolSnapshot() { return interconn.protocolSnapshot() },
+  bridgeCall(method, params, options) { return api._call(method, params, options) },
+  bridgeOn(event, handler) { return api.on(event, handler) },
+  bridgeStoreGet(key) { return store.get(key) },
+  bridgeStoreSet(key, value) { return store.set(key, value) },
+  bridgeStoreGetDialog(peer) { return store.getDialog(peer) },
+  bridgeStoreAppendDialog(peer, messages, prepend) { return store.appendDialog(peer, messages, prepend) },
+  bridgeStoreUpsertMessage(peer, message) { return store.upsertMessage(peer, message) },
+  bridgeStoreReplaceMessageId(peer, localId, message, operationId) { return store.replaceMessageId(peer, localId, message, operationId) },
+  bridgeStoreRemoveMessages(peer, ids) { return store.removeMessages(peer, ids) },
+  bridgeStoreUpsertDialog(dialog) { return store.upsertDialog(dialog) },
+  bridgeStoreClearDialogs() { return store.clearDialogs() },
+  bridgeStoreClearSession() { return store.clearSession() },
+  bridgeStoreLoadSettings() { return store.loadSettings() },
+  bridgeStoreSaveSettings() { return store.saveSettings() },
+  bridgeStoreSnapshot() { return store.snapshot() },
+
+  onDestroy() {
+    removers.forEach(remove => { try { remove() } catch (e) {} })
+    removers = []
+  },
+  onError(err) { console.error('[app] uncaught error:', err && err.message) },
+  onUnhandledRejection(data) { console.error('[app] unhandled rejection:', data && data.reason && data.reason.message) }
+}
+</script>

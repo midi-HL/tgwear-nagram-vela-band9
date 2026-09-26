@@ -1,0 +1,166 @@
+<template>
+  <div class="page">
+    <image src="/common/images/hd.png" static class="header" />
+    <text class="clock">{{nowTime}}</text>
+    <text class="title">手机连接诊断</text>
+
+    <div class="card">
+      <text class="label">系统互联</text>
+      <text class="value">{{systemState}}</text>
+      <text class="label">连接诊断</text>
+      <text class="value">{{diagnosisText}}</text>
+      <text class="label">手机桥接服务</text>
+      <text class="value">{{phoneServiceText}}</text>
+      <text class="label">手机消息监听</text>
+      <text class="value">{{phoneTransportText}}</text>
+      <text class="small">{{detail}}</text>
+    </div>
+
+    <text class="roundtrip">双向确认：{{roundTripText}}</text>
+    <input type="button" value="重新诊断" class="button secondary" @click="runDiagnosis" />
+    <input type="button" value="确认手机连接" class="button primary" if="{{challengePending}}" @click="acknowledgePhone" />
+    <text class="footer">在手机 TG Wear 诊断页点“发送手机→手环连接挑战”，再回到此页确认。</text>
+  </div>
+</template>
+
+<style>
+.page { width:212px; height:520px; background-color:#000000; }
+.header { position:absolute; left:0px; top:0px; width:212px; height:82px; }
+.clock { position:absolute; top:12px; left:0px; width:212px; line-height:24px; text-align:center; font-size:15px; color:rgba(255,255,255,0.6); }
+.title { position:absolute; top:34px; left:0px; width:212px; line-height:36px; text-align:center; font-size:22px; font-weight:bold; color:#ffffff; }
+.card { position:absolute; left:12px; top:82px; width:188px; height:260px; padding:10px 12px; background-color:#222222; border-radius:18px; flex-direction:column; }
+.label { font-size:13px; color:rgba(255,255,255,0.45); margin-top:3px; }
+.value { font-size:17px; color:#ffffff; lines:1; text-overflow:ellipsis; margin-top:1px; }
+.small { font-size:12px; color:rgba(255,255,255,0.55); lines:2; margin-top:5px; }
+.roundtrip { position:absolute; left:12px; top:348px; width:188px; line-height:28px; font-size:16px; text-align:center; color:#ffffff; }
+.button { position:absolute; left:36px; width:140px; height:42px; font-size:17px; border-radius:22px; }
+.secondary { top:382px; color:#ffffff; background-color:#383838; }
+.primary { top:432px; color:#000000; background-color:#2ea0ff; }
+.footer { position:absolute; left:14px; top:478px; width:184px; text-align:center; font-size:11px; color:rgba(255,255,255,0.4); lines:2; }
+</style>
+
+<script>
+import interconn from '../../utils/interconn'
+import api from '../../utils/api'
+import store from '../../utils/store'
+import { nowTimeString } from '../../utils/format'
+
+export default {
+  protected: {
+    nonce: ''
+  },
+  data: {
+    nowTime: '',
+    systemState: '正在读取',
+    diagnosisText: '尚未诊断',
+    phoneServiceText: '未知',
+    phoneTransportText: '未知',
+    roundTripText: '等待手机发起挑战',
+    detail: '',
+    challengePending: false,
+    challengeNonce: '',
+    _timer: null,
+    _offState: null,
+    _busy: false
+  },
+  onInit() {
+    const app = this.$app && this.$app.$def
+    if (!api.attachApp(app)) interconn.init()
+    store.attachApp(app)
+    this.challengeNonce = this.nonce || ''
+    this.challengePending = !!this.challengeNonce
+  },
+  onShow() {
+    this.updateTime()
+    if (this._timer) clearInterval(this._timer)
+    this._timer = setInterval(() => {
+      this.updateTime()
+      this.refreshChallenge()
+    }, 1000)
+    this._offState = interconn.onState((state, info) => {
+      this.systemState = state === 1 ? '已连接' : '未连接'
+      if (info && info.code) this.detail = '互联事件码：' + info.code
+    })
+    this.refreshChallenge()
+    this.runDiagnosis()
+  },
+  onHide() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null }
+    if (this._offState) { this._offState(); this._offState = null }
+  },
+  onDestroy() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null }
+    if (this._offState) { this._offState(); this._offState = null }
+  },
+  updateTime() { this.nowTime = nowTimeString() },
+  refreshChallenge() {
+    const challenge = store.get('connectionChallenge')
+    this.challengeNonce = this.nonce || (challenge && challenge.nonce ? challenge.nonce : '')
+    this.challengePending = !!this.challengeNonce
+    if (this.challengePending) this.roundTripText = '收到手机挑战，请点击确认'
+  },
+  async runDiagnosis() {
+    if (this._busy) return
+    this._busy = true
+    this.diagnosisText = '诊断中…'
+    try {
+      const state = await interconn.queryReadyState()
+      this.systemState = state && state.status === 1 ? '已连接' : '未连接'
+      const result = await interconn.diagnose(10000)
+      const labels = { 0: '连接正常', 204: '连接超时', 1001: '手机端 App 未安装', 1000: '其他连接错误' }
+      this.diagnosisText = labels[result.status] || ('状态码 ' + result.status)
+      this.detail = '系统诊断状态：' + result.status
+      if (result.status === 0) {
+        try {
+          const phone = await api.getBridgeStatus()
+          this.phoneServiceText = phone && phone.serviceRunning ? '运行中' : '未报告运行'
+          this.phoneTransportText = phone && phone.protocolReady ? 'TGW/2 已就绪' : (phone && phone.transportReady ? '物理监听在线，协议未握手' : '未就绪')
+          this.detail = '手机阶段：' + ((phone && phone.stage) || '未知')
+          if (phone && phone.protocolStage) this.detail += '；协议：' + phone.protocolStage
+          if (phone) this.detail += '；帧 收/发：' + (phone.rxFrames || 0) + '/' + (phone.txFrames || 0) + '；分块：' + (phone.protocolChunkBytes || 0) + 'B'
+          if (phone && phone.nodeId) this.detail += '；设备 ID：' + phone.nodeId
+          if (phone && phone.lastError) this.detail += '；' + phone.lastError
+        } catch (e) {
+          this.phoneServiceText = '无法读取'
+          this.phoneTransportText = '无法读取'
+          this.detail += '；手机状态查询失败：' + ((e && (e.msg || e.message)) || String(e))
+        }
+      } else {
+        this.phoneServiceText = '未连通'
+        this.phoneTransportText = '未连通'
+      }
+    } catch (e) {
+      this.systemState = '未连接'
+      this.diagnosisText = '诊断失败'
+      this.phoneServiceText = '不可达'
+      this.phoneTransportText = '不可达'
+      this.detail = (e && (e.msg || e.message)) || String(e)
+    } finally {
+      this._busy = false
+    }
+  },
+  async acknowledgePhone() {
+    if (!this.challengeNonce || this._busy) return
+    this._busy = true
+    this.roundTripText = '正在回传确认…'
+    try {
+      const result = await api.acknowledgePhoneProbe(this.challengeNonce)
+      if (result && result.ok) {
+        this.roundTripText = '手机↔手环双向通信成功'
+        this.challengePending = false
+        this.challengeNonce = ''
+        store.set('connectionChallenge', null)
+        this.detail = '手机已收到手环确认，双向应用消息往返通过。'
+      } else {
+        this.roundTripText = '手机收到请求，但挑战校验失败'
+        this.detail = '请从手机端重新发起连接挑战。'
+      }
+    } catch (e) {
+      this.roundTripText = '确认发送失败'
+      this.detail = (e && (e.msg || e.message)) || String(e)
+    } finally {
+      this._busy = false
+    }
+  }
+}
+</script>

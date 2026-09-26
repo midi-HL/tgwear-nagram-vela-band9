@@ -1,0 +1,51 @@
+
+> tgwear@0.1.0 build
+> aiot build --enable-custom-component
+
+🟠 [09-26 04:51:08] [toolkit]: enable-custom-component is deprecated , will be removed in version: 2.1.0 . please remove it now
+🔷 [09-26 04:51:08] [toolkit]: start build:  {
+  "projectPath": "/home/ubuntu/work/tgwear-investigation/source/tgwear-quickapp-main",
+  "options": {
+    "sourceRoot": "./src",
+    "signRoot": "./sign",
+    "releasePath": "./dist",
+    "outputPath": "./build",
+    "enableJsc": false,
+    "enableProtobuf": false,
+    "enableE2e": false,
+    "enableStats": false,
+    "optimizeCssAttr": false,
+    "completeFeature": false,
+    "dropConsole": false,
+    "enableCustomComponent": true,
+    "mode": "development"
+  },
+  "watch": false,
+  "node": "v22.13.0",
+  "platform": "linux",
+  "arch": "x64",
+  "toolkit": "2.0.5"
+}
+🟠 [09-26 04:51:09] [toolkit]: /home/ubuntu/work/tgwear-investigation/source/tgwear-quickapp-main/src/components/InputMethod/InputMethod.ux:15:16 ./assets/full/ suggested value (absolute path relative to src) /components/InputMethod/assets/full/
+🟠 [09-26 04:51:09] [toolkit]: /home/ubuntu/work/tgwear-investigation/source/tgwear-quickapp-main/src/components/InputMethod/InputMethod.ux:80:16 ./assets/t9/ suggested value (absolute path relative to src) /components/InputMethod/assets/t9/
+🟠 [09-26 04:51:09] [toolkit]: /home/ubuntu/work/tgwear-investigation/source/tgwear-quickapp-main/src/components/InputMethod/InputMethod.ux:262:16 ./assets/arc/ suggested value (absolute path relative to src) /components/InputMethod/assets/arc/
+🟠 [09-26 04:51:09] [toolkit]: /home/ubuntu/work/tgwear-investigation/source/tgwear-quickapp-main/src/components/InputMethod/InputMethod.ux:575:30 'oldV' is defined but never used.
+🟠 [09-26 04:51:09] [toolkit]: /home/ubuntu/work/tgwear-investigation/source/tgwear-quickapp-main/src/components/InputMethod/InputMethod.ux:578:35 'oldV' is defined but never used.
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: undefined
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Create a soft link to the node_modules folder
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Compile javascript project
+🔷 [09-26 04:51:10] [toolkit]: webpack complete
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Copy resource files
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Compress resource files
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Generate jsc bytecode
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Generate protobuf json
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: compile lite card
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Package the project into an RPK file
+🔷 [09-26 04:51:10] [toolkit]: privatekeyPath is  /home/ubuntu/work/tgwear-investigation/source/.temp_tgwear-quickapp-main/sign/debug/private.pem 
+certificatePath is  /home/ubuntu/work/tgwear-investigation/source/.temp_tgwear-quickapp-main/sign/debug/certificate.pem
+✅ [09-26 04:51:10] [toolkit]: Project build and generate files：/home/ubuntu/work/tgwear-investigation/source/.temp_tgwear-quickapp-main/dist/com.hrk.tgwear.debug.0.1.4.rpk
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Generate diff json
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Migrate temporary project
+🔷 [09-26 04:51:10] [toolkit]: afterCompile: Check resource
+✅ [09-26 04:51:10] [toolkit]: build success: 2570ms
+🟠 [09-26 04:51:10] [toolkit]: please use AIoT-IDE: https://iot.mi.com/vela/quickapp/zh/guide/start/use-ide.html
